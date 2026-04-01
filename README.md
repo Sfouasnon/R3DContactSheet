@@ -7,19 +7,20 @@ macOS-first RED `.R3D` still rendering and batch planning toolchain, built aroun
 - Verified working REDline single-frame R3D transcode path
 - Confirmed correct IPP2 display-referred output using:
   `colorSciVersion=3`, `outputToneMap=1`, `rollOff=2`, `outputGammaCurve=32`
-- Metadata-driven rendering is the default path in the wrapper
-- The wrapper intentionally does not pass `--useMeta` for the verified default render path
-- The new desktop app batches one still render per clip and prepares the project for LTC and contact-sheet follow-on work
+- Metadata-driven rendering now explicitly uses `--useMeta` so REDline applies actual clip look metadata
+- REDline output validation now accepts emitted names such as `output.jpg.000000.jpg` and normalizes them back to the expected output path
+- The desktop app now previews synchronized renders, outputs matched JPEG stills, and assembles a contact sheet PDF
 
 ## Desktop App
 
 The current app is a same-day macOS delivery build focused on:
 
 - REDline auto-detection with manual override and persisted path
-- Single clip or recursive reel-folder selection
+- One `Choose Source...` action that can target a single `.R3D`, an `.RDC` package, or a reel folder
 - Output folder selection
-- Sequential batch planning and rendering
-- Frame index targeting now, with timecode scaffolding ready for the next LTC step
+- Metadata-driven sync preview with detected clip FPS, resolved absolute frame, resolved timecode, sync basis, and sync status
+- Sequential batch planning, still rendering, and contact sheet PDF assembly
+- Automatic metadata-based sync with optional advanced target-timecode override when production provides a specific target
 - Logged commands, stdout/stderr capture, output existence checks, and per-job status
 - A REDCINE-X / REDline update prompt when the installed REDline looks missing or too old for the verified IPP2 flags
 
@@ -85,15 +86,29 @@ An alternate `py2app` setup file is also included in `setup.py`, but the verifie
 This iteration is intentionally centered on the core operator workflow:
 
 - point the app at REDline
-- choose a clip or reel
+- choose a media source
 - choose an output folder
-- choose a frame index or target timecode
-- preview the planned renders
-- render JPEG stills with the verified IPP2 output recipe
+- preview the synchronized clip plan
+- confirm the resolved frame/timecode match across cameras
+- build the contact sheet PDF with the verified IPP2 output recipe
+
+### Source Selection Notes
+
+- Visible build marker for this app bundle: `VERIFIED UI BUILD 2026-04-01-RDCFIX`
+- `Choose Source...` offers `Single R3D Clip`, `RDC Package`, and `Folder / Reel`
+- `RDC Package` uses a true macOS folder chooser so operators can choose the `.RDC` directly without opening it
+- `Folder / Reel` scans a reel or source directory for `.RDC` packages and standalone `.R3D` files
+- When an `.RDC` contains multiple `.R3D` segments, the app uses the primary segment, preferring `_001`
+- After selection, the app shows the source type, resolved clip count, grouping mode, and primary resolved clip in the source panel
+- The sync area now resolves the matching moment automatically from clip metadata and promotes that timecode as the primary review value
+- The preview table shows clip, group, FPS, resolved absolute frame, resolved timecode, sync basis, sync status, and output JPEG path
+- The run step writes JPEG intermediates and assembles `r3dcontactsheet_contact_sheet.pdf` as a readable 12-up, multi-page PDF
+- The app header now uses the approved R3DContactSheet logo with a compact sync-health indicator on the right
+- The replay shell script is written to the chosen output folder as `r3dcontactsheet_last_batch.sh`
 
 ## What Remains Next
 
 - LTC input beyond the current placeholder scaffold
-- frame index analyzer refinement using actual clip metadata
+- frame sync verification against a wider range of real RED metadata outputs
 - smarter auto-batching for multicamera mini-arrays inside larger folder trees
-- contact sheet builder and PDF layout/output controls
+- richer contact sheet layout/output controls

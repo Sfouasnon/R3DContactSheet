@@ -28,6 +28,7 @@ class AppSettings:
     resize_x: str = ""
     resize_y: str = ""
     group_mode: str = "flat"
+    custom_group_name: str = ""
     alphabetize: bool = True
     metadata_mode: bool = True
 
