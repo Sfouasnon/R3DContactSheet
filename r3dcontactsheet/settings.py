@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 
 def default_settings_path() -> Path:
+    config_root = os.getenv("XDG_CONFIG_HOME")
+    if config_root:
+        return Path(config_root).expanduser() / "R3DContactSheet" / "settings.json"
     return Path.home() / "Library" / "Application Support" / "R3DContactSheet" / "settings.json"
 
 
@@ -36,15 +40,28 @@ class AppSettings:
 class SettingsStore:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or default_settings_path()
+        self.last_status = f"Using defaults. Settings path: {self.path}"
 
     def load(self) -> AppSettings:
         if not self.path.exists():
+            self.last_status = f"Settings file not found. Using defaults at {self.path}."
             return AppSettings()
-        data = json.loads(self.path.read_text(encoding="utf-8"))
-        defaults = asdict(AppSettings())
-        defaults.update(data)
-        return AppSettings(**defaults)
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            defaults = asdict(AppSettings())
+            if not isinstance(data, dict):
+                raise ValueError("Settings file did not contain a JSON object.")
+            defaults.update(data)
+            self.last_status = f"Loaded settings from {self.path}."
+            return AppSettings(**defaults)
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            self.last_status = f"Settings were unreadable at {self.path}. Using defaults. ({exc})"
+            return AppSettings()
 
     def save(self, settings: AppSettings) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(asdict(settings), indent=2), encoding="utf-8")
+        payload = json.dumps(asdict(settings), indent=2)
+        temp_path = self.path.with_suffix(".tmp")
+        temp_path.write_text(payload, encoding="utf-8")
+        temp_path.replace(self.path)
+        self.last_status = f"Saved settings to {self.path}."

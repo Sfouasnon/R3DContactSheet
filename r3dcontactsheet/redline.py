@@ -134,13 +134,7 @@ def find_redline(paths: Optional[RedlinePaths] = None) -> Path:
         candidates.append(Path(env_value).expanduser())
 
     if sys.platform == "darwin":
-        candidates.extend(
-            [
-                Path("/Applications/REDCINE-X Professional/REDCINE-X PRO.app/Contents/MacOS/REDline"),
-                Path("/Applications/REDCINE-X PRO.app/Contents/MacOS/REDline"),
-                Path("/Applications/REDCINE-X PRO 64-bit.app/Contents/MacOS/REDline"),
-            ]
-        )
+        candidates.extend(_default_macos_redline_candidates())
     elif os.name == "nt":
         candidates.extend(
             [
@@ -168,6 +162,34 @@ def find_redline(paths: Optional[RedlinePaths] = None) -> Path:
     raise RedlineNotFoundError(
         "Could not find REDline. Install REDCINE-X PRO or choose the executable manually."
     )
+
+
+def _default_macos_redline_candidates() -> List[Path]:
+    static_candidates = [
+        Path("/Applications/REDCINE-X Professional/REDCINE-X PRO.app/Contents/MacOS/REDline"),
+        Path("/Applications/REDCINE-X Professional/REDCINE-X PRO.app/Contents/MacOS/REDLine"),
+        Path("/Applications/REDCINE-X PRO.app/Contents/MacOS/REDline"),
+        Path("/Applications/REDCINE-X PRO.app/Contents/MacOS/REDLine"),
+        Path("/Applications/REDCINE-X PRO 64-bit.app/Contents/MacOS/REDline"),
+        Path("/Applications/REDCINE-X PRO 64-bit.app/Contents/MacOS/REDLine"),
+    ]
+    discovered = []
+    for pattern in (
+        "/Applications/REDCINE-X*.app/Contents/MacOS/REDline",
+        "/Applications/REDCINE-X*.app/Contents/MacOS/REDLine",
+        str(Path.home() / "Applications" / "REDCINE-X*.app" / "Contents" / "MacOS" / "REDline"),
+        str(Path.home() / "Applications" / "REDCINE-X*.app" / "Contents" / "MacOS" / "REDLine"),
+    ):
+        discovered.extend(Path(match) for match in glob(pattern))
+    seen: set[Path] = set()
+    ordered: List[Path] = []
+    for candidate in [*static_candidates, *discovered]:
+        resolved = candidate.expanduser()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        ordered.append(resolved)
+    return ordered
 
 
 def probe_redline(paths: Optional[RedlinePaths] = None, timeout: float = 5.0) -> RedlineProbe:

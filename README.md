@@ -16,6 +16,7 @@ macOS-first RED `.R3D` still rendering and batch planning toolchain, built aroun
 The current app is a same-day macOS delivery build focused on:
 
 - REDline auto-detection with manual override and persisted path
+- Persistent per-user settings stored in `~/Library/Application Support/R3DContactSheet/settings.json`
 - One `Choose Source...` action that can target a single `.R3D`, an `.RDC` package, or a reel folder
 - Output folder selection
 - Metadata-driven sync preview with detected clip FPS, resolved absolute frame, resolved timecode, sync basis, and sync status
@@ -23,6 +24,27 @@ The current app is a same-day macOS delivery build focused on:
 - Automatic metadata-based sync with optional advanced target-timecode override when production provides a specific target
 - Logged commands, stdout/stderr capture, output existence checks, and per-job status
 - A REDCINE-X / REDline update prompt when the installed REDline looks missing or too old for the verified IPP2 flags
+
+## REDline Dependency
+
+R3DContactSheet does not bundle REDline.
+
+To preview metadata, render stills, or build the contact sheet PDF on another Mac, the user must already have REDCINE-X PRO installed so that REDline is available locally.
+
+The app now:
+
+- auto-detects REDline in common macOS REDCINE-X install locations
+- allows a manual REDline path override
+- persists that override in the per-user settings file
+- blocks preview/render with a clear message when REDline is missing or too old
+
+Typical expected REDline location on macOS:
+
+```text
+/Applications/REDCINE-X Professional/REDCINE-X PRO.app/Contents/MacOS/REDline
+```
+
+If REDline is not found, install REDCINE-X PRO first, then set the REDline path in the app and retry.
 
 Run it locally with:
 
@@ -81,6 +103,15 @@ dist/R3D Contact Sheet.app
 
 An alternate `py2app` setup file is also included in `setup.py`, but the verified same-day build path in this repository is currently PyInstaller.
 
+### Sharing Note
+
+This repository is ready to share as source, and the built `.app` can now be shared with another Mac user as long as:
+
+- REDCINE-X PRO / REDline is already installed on that machine
+- the recipient points the app to their local REDline executable if auto-detection does not find it
+
+REDline itself is an external dependency and is not included in this project or app bundle.
+
 ## Notes For Today
 
 This iteration is intentionally centered on the core operator workflow:
@@ -95,15 +126,14 @@ This iteration is intentionally centered on the core operator workflow:
 ### Source Selection Notes
 
 - Visible build marker for this app bundle: `VERIFIED UI BUILD 2026-04-01-RDCFIX`
-- `Choose Source...` offers `Single R3D Clip`, `RDC Package`, and `Folder / Reel`
-- `RDC Package` uses a true macOS folder chooser so operators can choose the `.RDC` directly without opening it
-- `Folder / Reel` scans a reel or source directory for `.RDC` packages and standalone `.R3D` files
+- `Choose Source...` scans a selected media location for `.RDC` packages and standalone `.R3D` files
+- `.RDC` packages are treated as camera clip containers without requiring “Show Package Contents”
 - When an `.RDC` contains multiple `.R3D` segments, the app uses the primary segment, preferring `_001`
 - After selection, the app shows the source type, resolved clip count, grouping mode, and primary resolved clip in the source panel
 - The sync area now resolves the matching moment automatically from clip metadata and promotes that timecode as the primary review value
 - The preview table shows clip, group, FPS, resolved absolute frame, resolved timecode, sync basis, sync status, and output JPEG path
 - The run step writes JPEG intermediates and assembles `r3dcontactsheet_contact_sheet.pdf` as a readable 12-up, multi-page PDF
-- The app header now uses the approved R3DContactSheet logo with a compact sync-health indicator on the right
+- The app header now uses the approved R3DContactSheet logo with a compact sync-health indicator and system status
 - The replay shell script is written to the chosen output folder as `r3dcontactsheet_last_batch.sh`
 
 ## What Remains Next

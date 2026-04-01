@@ -60,7 +60,6 @@ def build_contact_sheet_pdf(
             header_lines=header_lines,
             page_number=page_index + 1,
             total_pages=total_pages,
-            logo_path=logo_path,
         )
         pages.append(page.convert("RGB"))
     first, rest = pages[0], pages[1:]
@@ -75,7 +74,6 @@ def _build_page(
     header_lines: Sequence[str],
     page_number: int,
     total_pages: int,
-    logo_path: Path | None,
 ) -> Image.Image:
     page = Image.new("RGB", PDF_SIZE, color=PAGE_BG)
     draw = ImageDraw.Draw(page)
@@ -86,8 +84,6 @@ def _build_page(
     status_font = _load_font(28, bold=True)
 
     content_x = PAGE_MARGIN
-    if logo_path is not None and logo_path.exists():
-        content_x = _paste_header_logo(page, logo_path)
     draw.text((content_x, 34), title, fill=TEXT_PRIMARY, font=title_font)
     y = 96
     for line in header_lines:
@@ -143,17 +139,6 @@ def _paste_cover(page: Image.Image, image_path: Path, box: tuple[int, int, int, 
         crop_top = max(0, (resized.height - target_height) // 2)
         cropped = resized.crop((crop_left, crop_top, crop_left + target_width, crop_top + target_height))
         page.paste(cropped, (left, top))
-
-
-def _paste_header_logo(page: Image.Image, image_path: Path) -> int:
-    with Image.open(image_path) as image:
-        image = image.convert("RGBA")
-        target_height = 118
-        scale = target_height / image.height
-        target_width = max(220, int(image.width * scale))
-        resized = image.resize((target_width, target_height))
-        page.paste(resized, (PAGE_MARGIN, 20), resized)
-    return PAGE_MARGIN + target_width + 24
 
 
 def _draw_centered_text(

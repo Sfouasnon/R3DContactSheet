@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from r3dcontactsheet.redline import RenderJob, RenderSettings, render_frame
+from r3dcontactsheet.redline import RenderJob, RenderSettings, _default_macos_redline_candidates, render_frame
 
 
 class RenderOutputDetectionTests(unittest.TestCase):
@@ -33,6 +33,13 @@ class RenderOutputDetectionTests(unittest.TestCase):
             self.assertFalse(emitted_output.exists())
             self.assertEqual(result.output_exists, True)
             self.assertGreaterEqual(result.output_size, 4096)
+
+    def test_default_macos_candidates_include_common_redline_names(self):
+        candidates = _default_macos_redline_candidates()
+        candidate_strings = {str(path) for path in candidates}
+
+        self.assertIn("/Applications/REDCINE-X Professional/REDCINE-X PRO.app/Contents/MacOS/REDline", candidate_strings)
+        self.assertIn("/Applications/REDCINE-X Professional/REDCINE-X PRO.app/Contents/MacOS/REDLine", candidate_strings)
 
 
 if __name__ == "__main__":

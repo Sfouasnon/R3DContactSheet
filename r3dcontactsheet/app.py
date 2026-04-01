@@ -80,6 +80,7 @@ class MainWindow(QMainWindow):
         self.preview_context: PreviewContext | None = None
         self.active_subset: OverlapSubset | None = None
         self.current_selection: MatchSelectionState = MatchSelectionState(None, None, "auto")
+        self.redline_ready = False
 
         self._build_ui()
         self._apply_settings_to_ui()
@@ -145,9 +146,10 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
 
         header_row = QHBoxLayout()
-        header_row.setSpacing(14)
+        header_row.setSpacing(12)
         logo_label = QLabel()
-        logo_label.setFixedSize(280, 58)
+        logo_label.setFixedSize(260, 52)
+        logo_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         logo_pixmap = self._load_header_logo(logo_label.size().width(), logo_label.size().height())
         if not logo_pixmap.isNull():
             logo_label.setPixmap(logo_pixmap)
@@ -159,6 +161,7 @@ class MainWindow(QMainWindow):
         self.status_label.setWordWrap(True)
         self.status_label.setObjectName("summaryBright")
         header_row.addWidget(self.status_label, 1, Qt.AlignVCenter)
+        header_row.addStretch(1)
         layout.addLayout(header_row)
         return box
 
@@ -206,6 +209,9 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.output_edit, 4, 1)
         left_layout.addWidget(self.output_button, 4, 2)
 
+        right_column = QVBoxLayout()
+        right_column.setSpacing(12)
+
         summary = self._section_box("2. Source Summary")
         summary_layout = QVBoxLayout(summary)
         self.source_type_label = QLabel("No source selected.")
@@ -219,10 +225,28 @@ class MainWindow(QMainWindow):
         summary_layout.addWidget(self.source_type_label)
         summary_layout.addWidget(self.source_count_label)
         summary_layout.addWidget(self.source_detail_label)
-        summary.setMinimumWidth(420)
+        summary.setMinimumWidth(400)
+
+        system_box = self._section_box("System Status")
+        system_layout = QVBoxLayout(system_box)
+        system_layout.setSpacing(6)
+        self.redline_state_label = QLabel("REDline status will appear here after startup.")
+        self.redline_state_label.setWordWrap(True)
+        self.redline_state_label.setObjectName("summaryBright")
+        self.redline_path_label = QLabel("Configured REDline path will appear here.")
+        self.redline_path_label.setWordWrap(True)
+        self.redline_path_label.setObjectName("muted")
+        self.config_status_label = QLabel(self.store.last_status)
+        self.config_status_label.setWordWrap(True)
+        self.config_status_label.setObjectName("mutedBlue")
+        system_layout.addWidget(self.redline_state_label)
+        system_layout.addWidget(self.redline_path_label)
+        system_layout.addWidget(self.config_status_label)
+        right_column.addWidget(summary)
+        right_column.addWidget(system_box)
 
         outer.addWidget(left, 3)
-        outer.addWidget(summary, 2)
+        outer.addLayout(right_column, 2)
         return box
 
     def _build_frame_section(self) -> QGroupBox:
@@ -336,6 +360,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
 
         top_row = QHBoxLayout()
+        top_row.setAlignment(Qt.AlignTop)
         top_row.addWidget(QLabel("Grouping mode"))
         self.group_mode_combo = QComboBox()
         self.group_mode_combo.addItems(["flat", "parent_folder", "reel_prefix"])
@@ -350,13 +375,18 @@ class MainWindow(QMainWindow):
         prompt = QLabel("Preview is the sync check. Review LTC in/out, per-clip match frame, match timecode, and status before building the contact sheet PDF.")
         prompt.setObjectName("muted")
         top_row.addWidget(prompt, 1)
+        preview_action_column = QVBoxLayout()
+        preview_action_column.setSpacing(4)
         self.preview_button = QPushButton("Preview Batch")
-        top_row.addWidget(self.preview_button)
-        layout.addLayout(top_row)
+        preview_action_column.addWidget(self.preview_button, 0, Qt.AlignRight)
         self.preview_help_label = QLabel("Click once — scanning media may take a moment.")
         self.preview_help_label.setObjectName("muted")
         self.preview_help_label.setWordWrap(True)
-        layout.addWidget(self.preview_help_label)
+        self.preview_help_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        self.preview_help_label.setMaximumWidth(260)
+        preview_action_column.addWidget(self.preview_help_label, 0, Qt.AlignRight)
+        top_row.addLayout(preview_action_column)
+        layout.addLayout(top_row)
 
         analysis_row = QHBoxLayout()
         analysis_row.setSpacing(12)
@@ -668,11 +698,23 @@ class MainWindow(QMainWindow):
         probe = probe_redline(paths=None if explicit is None else RedlinePaths(explicit_path=explicit))
         if probe.available and probe.executable:
             self._set_path_field(self.redline_edit, str(probe.executable))
+        self.redline_ready = bool(probe.available and probe.compatible and probe.executable)
+        self.preview_button.setEnabled(self.redline_ready)
+        self.run_button.setEnabled(self.redline_ready)
+        if probe.available and probe.executable:
+            self.redline_state_label.setText("REDline found and executable." if probe.compatible else "REDline found, but this build needs a newer REDCINE-X / REDline.")
+            self.redline_path_label.setText(f"Path: {probe.executable}")
+        else:
+            self.redline_state_label.setText("REDline not found. R3DContactSheet requires REDCINE-X PRO to be installed before preview or render can run.")
+            self.redline_path_label.setText("Path: Set REDline manually with Choose REDline after installing REDCINE-X PRO.")
+        self.config_status_label.setText(self.store.last_status)
         if probe.available and probe.compatible:
             self._set_health_state("yellow", "REDline ready. Preview a source to verify metadata and matched-frame sync.")
         else:
             self._set_health_state("red", "REDline unavailable or too old for the verified render path.")
         if probe.available and not probe.compatible:
+            self._append_log(probe.message)
+        if not probe.available:
             self._append_log(probe.message)
 
     def _build_preview_context(self) -> PreviewContext:
@@ -1257,7 +1299,7 @@ class MainWindow(QMainWindow):
             ),
         ]
         destination = output_dir / CONTACT_SHEET_NAME
-        return build_contact_sheet_pdf(items, destination, "R3DContactSheet", header_lines=header_lines, logo_path=_resource_path(LOGO_NAME))
+        return build_contact_sheet_pdf(items, destination, "R3DContactSheet", header_lines=header_lines)
 
     def _update_health_from_plan(self, plan) -> None:
         if not plan:
@@ -1346,7 +1388,7 @@ class MainWindow(QMainWindow):
         return "Mixed"
 
     def _set_preview_busy(self, busy: bool, text: str | None = None) -> None:
-        self.preview_button.setDisabled(busy)
+        self.preview_button.setDisabled(busy or not self.redline_ready)
         self.preview_button.setText((text or self._preview_idle_text) if busy else self._preview_idle_text)
         if busy:
             self.preview_button.setStyleSheet(
@@ -1407,6 +1449,7 @@ class MainWindow(QMainWindow):
             metadata_mode=self.metadata_mode_check.isChecked(),
         )
         self.store.save(settings)
+        self.config_status_label.setText(self.store.last_status)
         self.summary_label.setText("Settings remembered for the next launch.")
 
     def _append_log(self, text: str) -> None:
@@ -1425,13 +1468,11 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap(str(logo_path))
         if pixmap.isNull():
             return QPixmap()
-        scaled = pixmap.scaled(width, height, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-        x = max(0, (scaled.width() - width) // 2)
-        y = max(0, (scaled.height() - height) // 2)
-        return scaled.copy(x, y, width, height)
+        return pixmap.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
     def _log_startup_banner(self) -> None:
         self._append_log(f"STARTUP: {BUILD_MARKER}")
+        self._append_log(self.store.last_status)
 
 
 def sys_platform_is_macos() -> bool:
@@ -1466,11 +1507,18 @@ def _applescript_quote(value: str) -> str:
 
 
 def _resource_path(name: str) -> Path:
-    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
-    candidate = base / name
-    if candidate.exists():
-        return candidate
-    return Path(__file__).resolve().parent.parent / name
+    candidates = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / name)
+    candidates.append(Path(__file__).resolve().parent.parent / name)
+    executable_dir = Path(sys.executable).resolve().parent
+    candidates.append(executable_dir / name)
+    candidates.append(executable_dir.parent / "Resources" / name)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[1]
 
 
 def _apply_app_palette(app: QApplication) -> None:
