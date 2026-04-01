@@ -10,6 +10,11 @@ temp/
 # python
 __pycache__/
 *.pyc
+build/
+dist/
+*.egg-info/
+.eggs/
+*.spec
 
 # misc
 .env
