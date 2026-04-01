@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# temp renders
+redlinetest/
+*_renders/
+tmp/
+temp/
+
+# python
+__pycache__/
+*.pyc
+
+# misc
+.env
