@@ -1,7 +1,15 @@
 import unittest
 from pathlib import Path
 
-from r3dcontactsheet.frame_index import FrameTargetRequest, clip_timecode_out, resolve_clip_frame, resolve_matching_moment
+from r3dcontactsheet.frame_index import (
+    FrameTargetRequest,
+    MatchSelectionState,
+    choose_auto_fallback_frame,
+    clip_timecode_out,
+    resolve_clip_frame,
+    resolve_clip_frame_for_selection,
+    resolve_matching_moment,
+)
 from r3dcontactsheet.metadata import ClipMetadata
 
 
@@ -235,6 +243,39 @@ class AutomaticSyncTests(unittest.TestCase):
 
         self.assertEqual(moment.sync_mode, "full")
         self.assertEqual(moment.source_timecode, "15:06:53:22")
+
+    def test_sync_off_fallback_prefers_middle_region(self):
+        clip = ClipMetadata(
+            clip_path=Path("/tmp/A001.R3D"),
+            clip_fps=24.0,
+            timecode_base_fps=24.0,
+            start_timecode="15:06:53:21",
+            total_frames=100,
+            resolution="5760x3240",
+            timecode_source="edge timecode",
+            drop_frame=False,
+            sync_basis="REDline printMeta",
+            metadata_ok=True,
+            raw_fields={},
+            end_timecode="15:06:57:00",
+            manufacturer="RED",
+            format_type="R3D",
+            provider_name="red",
+            timecode_supported=True,
+            sync_eligible=True,
+            render_supported=True,
+        )
+
+        frame_index = choose_auto_fallback_frame(clip)
+        resolution = resolve_clip_frame_for_selection(
+            clip,
+            active_subset=None,
+            selection=MatchSelectionState(None, None, "auto"),
+            sync_mode="sync_off",
+        )
+
+        self.assertEqual(frame_index, 59)
+        self.assertEqual(resolution.frame_index, 59)
 
 
 if __name__ == "__main__":

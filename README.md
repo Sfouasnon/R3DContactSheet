@@ -86,7 +86,7 @@ Tested build path:
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 -m PyInstaller -y --windowed --name "R3D Contact Sheet" app.py
+./packaging/build_mac_app.sh
 ```
 
 Recommended one-step build command:
@@ -101,6 +101,36 @@ Expected deliverable:
 dist/R3D Contact Sheet.app
 ```
 
+The packaging script now:
+
+- reports host architecture
+- reports Python interpreter architecture
+- requests a `universal2` build when the local Python toolchain supports it
+- verifies the built `.app` architecture after packaging
+- warns clearly if the output is single-architecture rather than universal
+- falls back to a native-architecture build when a universal2 build is blocked by a single-architecture packaged dependency
+
+### Verify Built App Architecture
+
+Inspect the packaged app executable:
+
+```bash
+lipo -archs "dist/R3D Contact Sheet.app/Contents/MacOS/R3D Contact Sheet"
+```
+
+Inspect the executable plus the embedded Python runtime:
+
+```bash
+file "dist/R3D Contact Sheet.app/Contents/MacOS/R3D Contact Sheet"
+find "dist/R3D Contact Sheet.app/Contents/Frameworks" -type f \( -name Python -o -name Python3 \) -maxdepth 3 -print
+```
+
+Why this matters:
+
+- `arm64`-only builds will not launch on Intel Macs
+- `x86_64`-only builds will run under Rosetta on Apple Silicon, but are not ideal
+- `universal2` builds are the broadest option for sharing across Intel and Apple Silicon Macs
+
 An alternate `py2app` setup file is also included in `setup.py`, but the verified same-day build path in this repository is currently PyInstaller.
 
 ### Sharing Note
@@ -111,6 +141,17 @@ This repository is ready to share as source, and the built `.app` can now be sha
 - the recipient points the app to their local REDline executable if auto-detection does not find it
 
 REDline itself is an external dependency and is not included in this project or app bundle.
+
+### Signing / Notarization Caveat
+
+The current build script produces an unsigned `.app`.
+
+For the smoothest experience on another Mac, especially outside a developer workflow, you may still want to:
+
+- code sign the app
+- notarize it with Apple
+
+Those steps are separate from this repository’s REDline/sync logic and are not handled automatically yet.
 
 ## Notes For Today
 

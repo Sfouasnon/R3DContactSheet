@@ -32,13 +32,20 @@ class SettingsStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "settings.json"
             store = SettingsStore(path)
-            settings = AppSettings(redline_path="/Applications/REDline", last_output_path="/tmp/out")
+            settings = AppSettings(
+                redline_path="/Applications/REDline",
+                last_output_path="/tmp/out",
+                sync_mode="sync_off",
+                theme_name="light",
+            )
 
             store.save(settings)
             loaded = store.load()
 
             self.assertEqual(loaded.redline_path, "/Applications/REDline")
             self.assertEqual(loaded.last_output_path, "/tmp/out")
+            self.assertEqual(loaded.sync_mode, "sync_off")
+            self.assertEqual(loaded.theme_name, "light")
             payload = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(payload["redline_path"], "/Applications/REDline")
 

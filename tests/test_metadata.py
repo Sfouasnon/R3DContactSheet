@@ -1,8 +1,16 @@
+import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from r3dcontactsheet.metadata import _parse_perframe_csv, load_clip_metadata, parse_redline_printmeta
+from r3dcontactsheet.metadata import (
+    RedlineMetadataError,
+    _parse_perframe_csv,
+    _validate_redline_executable,
+    load_clip_metadata,
+    parse_redline_printmeta,
+)
 
 
 class MetadataParsingTests(unittest.TestCase):
@@ -60,7 +68,11 @@ class MetadataParsingTests(unittest.TestCase):
             self._completed(perframe_output),
         ]
 
-        metadata = load_clip_metadata(Path("/tmp/A001.R3D"), "/Applications/REDline")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            redline = Path(tmpdir) / "REDline"
+            redline.write_text("binary", encoding="utf-8")
+            redline.chmod(0o755)
+            metadata = load_clip_metadata(Path("/tmp/A001.R3D"), str(redline))
 
         self.assertEqual(metadata.start_timecode, "15:41:34:01")
         self.assertEqual(metadata.end_timecode, "15:41:34:21")
@@ -71,6 +83,7 @@ class MetadataParsingTests(unittest.TestCase):
         self.assertIn("--printMeta", perframe_call)
         self.assertIn("5", perframe_call)
         self.assertNotIn("--silent", perframe_call)
+        self.assertIsNotNone(mock_run.call_args_list[-1].kwargs.get("env"))
 
     @patch("r3dcontactsheet.metadata.subprocess.run")
     def test_load_clip_metadata_marks_timecode_incomplete_when_perframe_missing(self, mock_run):
@@ -86,12 +99,26 @@ class MetadataParsingTests(unittest.TestCase):
             self._completed(""),
         ]
 
-        metadata = load_clip_metadata(Path("/tmp/A001.R3D"), "/Applications/REDline")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            redline = Path(tmpdir) / "REDline"
+            redline.write_text("binary", encoding="utf-8")
+            redline.chmod(0o755)
+            metadata = load_clip_metadata(Path("/tmp/A001.R3D"), str(redline))
 
         self.assertIsNone(metadata.start_timecode)
         self.assertIsNone(metadata.end_timecode)
         self.assertIsNone(metadata.total_frames)
         self.assertFalse(metadata.metadata_ok)
+        self.assertIn("REDline returned no per-frame CSV output", metadata.metadata_error)
+
+    def test_validate_redline_executable_rejects_non_executable_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "REDline"
+            path.write_text("binary", encoding="utf-8")
+            path.chmod(0o644)
+
+            with self.assertRaises(RedlineMetadataError):
+                _validate_redline_executable(path)
 
     def _completed(self, stdout: str):
         import subprocess

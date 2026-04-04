@@ -35,6 +35,8 @@ class AppSettings:
     custom_group_name: str = ""
     alphabetize: bool = True
     metadata_mode: bool = True
+    sync_mode: str = "sync_on"
+    theme_name: str = "dark"
 
 
 class SettingsStore:

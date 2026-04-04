@@ -18,3 +18,9 @@ dist/
 
 # misc
 .env
+build_logs/
+runs/
+*.log
+build_logs/
+runs/
+*.log

@@ -258,10 +258,13 @@ def resolve_clip_frame_for_selection(
     clip_metadata: ClipMetadata,
     active_subset: Optional[OverlapSubset],
     selection: MatchSelectionState,
+    *,
+    sync_mode: str = "sync_on",
 ) -> FrameResolution:
     if not clip_metadata.metadata_ok or not clip_metadata.start_timecode or clip_metadata.timecode_base_fps is None:
+        fallback_index = choose_auto_fallback_frame(clip_metadata)
         return FrameResolution(
-            frame_index=0,
+            frame_index=fallback_index,
             source="overlap_selection",
             verification_note="Clip metadata is incomplete.",
             absolute_frame=None,
@@ -285,12 +288,14 @@ def resolve_clip_frame_for_selection(
     in_subset = bool(active_subset and path_text in active_subset.clip_paths)
 
     if selected_abs is None:
+        fallback_index = choose_auto_fallback_frame(clip_metadata)
+        chosen_abs = clip_start + fallback_index
         return FrameResolution(
-            frame_index=0,
+            frame_index=fallback_index,
             source="overlap_selection",
             verification_note="No valid overlap subset was available.",
-            absolute_frame=clip_start,
-            resolved_timecode=clip_metadata.start_timecode,
+            absolute_frame=chosen_abs,
+            resolved_timecode=_timecode_for_absolute_frame(clip_metadata, chosen_abs),
             clip_fps=clip_metadata.clip_fps,
             timecode_base_fps=clip_metadata.timecode_base_fps,
             sync_basis=clip_metadata.sync_basis,
@@ -299,8 +304,8 @@ def resolve_clip_frame_for_selection(
             in_matched_subset=False,
             source_timecode_in=clip_metadata.start_timecode,
             source_timecode_out=clip_timecode_out(clip_metadata),
-            match_timecode=clip_metadata.start_timecode,
-            match_frame=clip_start,
+            match_timecode=_timecode_for_absolute_frame(clip_metadata, chosen_abs),
+            match_frame=chosen_abs,
             range_relation="Unavailable",
         )
 
@@ -308,6 +313,10 @@ def resolve_clip_frame_for_selection(
         chosen_abs = selected_abs
         relation = "In Range"
         sync_status = "exact_match"
+    elif sync_mode == "sync_off":
+        chosen_abs = clip_start + choose_auto_fallback_frame(clip_metadata)
+        relation = "Later Only" if selected_abs < clip_start else "Earlier Only"
+        sync_status = "nearest_available"
     elif selected_abs < clip_start:
         chosen_abs = clip_start
         relation = "Later Only"
@@ -470,7 +479,7 @@ def _collect_overlap_subsets(items: Sequence[ClipMetadata]) -> list[OverlapSubse
                 start_timecode=_timecode_for_absolute_frame(reference, start) or "Unavailable",
                 end_timecode=_timecode_for_absolute_frame(reference, end) or "Unavailable",
                 shared_frame_count=(end - start) + 1,
-                recommended_abs_frame=start if start == end else start + ((end - start) // 2),
+                recommended_abs_frame=choose_overlap_frame_near_midpoint(start, end),
             )
         )
     return subsets
@@ -592,3 +601,16 @@ def _timecode_for_absolute_frame(item: ClipMetadata, absolute_frame: int) -> Opt
 
 def _clip_paths(items: Sequence[ClipMetadata]) -> tuple[str, ...]:
     return tuple(str(item.clip_path.resolve()) for item in items)
+
+
+def choose_overlap_frame_near_midpoint(start_abs_frame: int, end_abs_frame: int) -> int:
+    if start_abs_frame >= end_abs_frame:
+        return start_abs_frame
+    return start_abs_frame + ((end_abs_frame - start_abs_frame) // 2)
+
+
+def choose_auto_fallback_frame(item: ClipMetadata, bias: float = 0.6) -> int:
+    if item.total_frames is None or item.total_frames <= 1:
+        return 0
+    clipped_bias = max(0.0, min(1.0, bias))
+    return max(0, min(item.total_frames - 1, int(round((item.total_frames - 1) * clipped_bias))))

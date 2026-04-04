@@ -15,15 +15,16 @@ from .frame_index import (
     MatchingMoment,
     OverlapSubset,
     analyze_overlap_subsets,
-    resolve_clip_frame,
     resolve_clip_frame_for_selection,
     resolve_matching_moment,
 )
-from .metadata import ClipMetadata, load_clip_metadata
+from .metadata import ClipMetadata
+from .media_providers import GENERIC_VIDEO_EXTENSIONS, load_provider_metadata, provider_kind_for_path
 from .redline import RenderJob, RenderSettings
 
 
 GroupMode = Literal["flat", "parent_folder", "reel_prefix", "custom"]
+SyncMode = Literal["sync_on", "sync_off"]
 
 
 @dataclass(frozen=True)
@@ -32,11 +33,23 @@ class ClipEntry:
     clip_name: str
     reel_name: str
     group_name: str
-    source_kind: Literal["r3d", "rdc"]
+    source_kind: Literal["r3d", "rdc", "video", "braw"]
+    provider_kind: str = "red"
+    manufacturer: str = ""
+    format_type: str = ""
     container_path: Optional[Path] = None
     package_path: Optional[Path] = None
     segment_count: int = 1
     segment_index: int = 1
+
+
+@dataclass
+class ClipOrganization:
+    group_name: str
+    subgroup_name: str = ""
+    camera_label: str = ""
+    manufacturer: str = ""
+    format_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -48,6 +61,7 @@ class BatchOptions:
     alphabetize: bool = True
     custom_group_name: Optional[str] = None
     redline_exe: Optional[str] = None
+    sync_mode: SyncMode = "sync_on"
 
 
 @dataclass
@@ -57,17 +71,19 @@ class PreviewContext:
     metadata_by_clip: dict[Path, ClipMetadata]
     overlap_subsets: list[OverlapSubset]
     selection: MatchSelectionState
+    clip_fields: dict[Path, ClipOrganization]
 
 
 @dataclass(frozen=True)
 class JobPlanItem:
     clip: ClipEntry
     clip_metadata: ClipMetadata
+    clip_fields: ClipOrganization
     frame_resolution: FrameResolution
     matching_moment: MatchingMoment
     output_group: str
     output_file: Path
-    render_job: RenderJob
+    render_job: Optional[RenderJob]
 
 
 def discover_r3d_clips(path: Path, group_mode: GroupMode = "flat", alphabetize: bool = True) -> List[ClipEntry]:
@@ -78,7 +94,7 @@ def discover_r3d_clips(path: Path, group_mode: GroupMode = "flat", alphabetize: 
     if src.is_file():
         clip = _resolve_clip_path(src, group_mode)
         if clip is None:
-            raise FileNotFoundError(f"Selected file is not a usable .R3D clip: {src}")
+            raise FileNotFoundError(f"Selected file is not a supported clip or video source: {src}")
         clips = [clip]
     elif _is_rdc_dir(src):
         clips = [_resolve_rdc_package(src, group_mode)]
@@ -87,12 +103,15 @@ def discover_r3d_clips(path: Path, group_mode: GroupMode = "flat", alphabetize: 
 
     if not clips:
         raise FileNotFoundError(
-            f"No usable RED clips were found in {src}. Select a .R3D, an .RDC package, or a folder containing them."
+            f"No usable clips were found in {src}. Select a .R3D, an .RDC package, or a folder containing RED or common video files."
         )
 
     if alphabetize:
         clips.sort(key=lambda item: (_natural_sort_key(item.group_name), _natural_sort_key(item.clip_name)))
     return clips
+
+
+discover_media_clips = discover_r3d_clips
 
 
 def build_job_plan(clips: Iterable[ClipEntry], options: BatchOptions) -> List[JobPlanItem]:
@@ -104,19 +123,33 @@ def build_preview_context(clips: Iterable[ClipEntry], options: BatchOptions) -> 
     output_dir = options.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     clip_list = list(clips)
-    if not options.redline_exe:
-        raise ValueError("A REDline executable is required for metadata-driven sync resolution.")
-    metadata_by_clip = {
-        clip.source_path: load_clip_metadata(clip.source_path, options.redline_exe)
-        for clip in clip_list
-    }
-    overlap_subsets, selection = analyze_overlap_subsets(list(metadata_by_clip.values()), options.frame_request)
+    if any(clip.provider_kind == "red" for clip in clip_list) and not options.redline_exe:
+        raise ValueError("RED clips require a REDline executable for metadata-driven sync resolution.")
+    metadata_by_clip = {}
+    clip_fields: dict[Path, ClipOrganization] = {}
+    for clip in clip_list:
+        metadata = load_provider_metadata(
+            clip.source_path,
+            provider_kind=clip.provider_kind,
+            redline_exe=options.redline_exe,
+        )
+        metadata_by_clip[clip.source_path] = metadata
+        clip_fields[clip.source_path] = ClipOrganization(
+            group_name=clip.group_name,
+            subgroup_name="",
+            camera_label=_default_camera_label(clip.clip_name),
+            manufacturer=metadata.manufacturer or clip.manufacturer or _manufacturer_for_provider(clip.provider_kind),
+            format_type=metadata.format_type or clip.format_type or clip.source_path.suffix.lstrip(".").upper(),
+        )
+    eligible = [item for item in metadata_by_clip.values() if item.sync_eligible]
+    overlap_subsets, selection = analyze_overlap_subsets(eligible, options.frame_request)
     return PreviewContext(
         clips=clip_list,
         options=options,
         metadata_by_clip=metadata_by_clip,
         overlap_subsets=overlap_subsets,
         selection=selection,
+        clip_fields=clip_fields,
     )
 
 
@@ -135,20 +168,29 @@ def build_job_plan_from_context(
 
     for index, clip in enumerate(context.clips, start=1):
         clip_metadata = context.metadata_by_clip[clip.source_path]
-        frame_resolution = resolve_clip_frame_for_selection(clip_metadata, active_subset, selection)
-        output_group = _resolve_output_group(clip, context.options)
-        output_name = _build_output_name(clip, index)
-        output_file = frames_dir / output_name
-        render_job = RenderJob(
-            input_file=clip.source_path,
-            frame_index=frame_resolution.frame_index,
-            output_file=output_file,
-            settings=context.options.settings,
+        clip_fields = context.clip_fields.get(clip.source_path) or ClipOrganization(group_name=clip.group_name)
+        frame_resolution = resolve_clip_frame_for_selection(
+            clip_metadata,
+            active_subset,
+            selection,
+            sync_mode=context.options.sync_mode,
         )
+        output_group = _resolve_output_group(clip, clip_fields, context.options)
+        output_name = _build_output_name(clip, clip_fields, index)
+        output_file = frames_dir / output_name
+        render_job = None
+        if clip.provider_kind == "red":
+            render_job = RenderJob(
+                input_file=clip.source_path,
+                frame_index=frame_resolution.frame_index,
+                output_file=output_file,
+                settings=context.options.settings,
+            )
         plan.append(
             JobPlanItem(
                 clip=clip,
                 clip_metadata=clip_metadata,
+                clip_fields=clip_fields,
                 frame_resolution=frame_resolution,
                 matching_moment=matching_moment,
                 output_group=output_group,
@@ -203,10 +245,12 @@ def _matching_moment_from_selection(
     )
 
 
-def _resolve_output_group(clip: ClipEntry, options: BatchOptions) -> str:
+def _resolve_output_group(clip: ClipEntry, clip_fields: ClipOrganization, options: BatchOptions) -> str:
     if options.group_mode == "custom":
         custom = (options.custom_group_name or "").strip()
         return custom or "renders"
+    if clip_fields.group_name.strip():
+        return clip_fields.group_name.strip()
     if options.group_mode == "flat":
         return "renders"
     return clip.group_name
@@ -219,7 +263,9 @@ def describe_source_selection(path: Path) -> str:
     if src.is_file():
         if src.suffix.lower() == ".r3d":
             return f"Selected clip: {src.name}"
-        return f"Selected file is not a RED clip: {src.name}"
+        if src.suffix.lower() in GENERIC_VIDEO_EXTENSIONS:
+            return f"Selected media file: {src.name}"
+        return f"Selected file is not a supported media clip: {src.name}"
     if _is_rdc_dir(src):
         segments = _list_r3d_segments(src)
         if not segments:
@@ -241,10 +287,10 @@ def _scan_source_tree(src: Path, group_mode: GroupMode) -> List[ClipEntry]:
             clips.append(_resolve_rdc_package(root_path / package_name, group_mode))
         dirnames[:] = [name for name in dirnames if name.lower() not in {name.lower() for name in package_dirs}]
 
-        # Standalone R3D files not already represented by an RDC package.
+        # Standalone R3D files and generic video clips not already represented by an RDC package.
         for filename in sorted(filenames, key=_natural_sort_key):
             candidate = root_path / filename
-            if candidate.suffix.lower() != ".r3d":
+            if candidate.suffix.lower() not in {".r3d", *GENERIC_VIDEO_EXTENSIONS}:
                 continue
             if _find_rdc_ancestor(candidate, src) is not None:
                 continue
@@ -277,10 +323,31 @@ def _resolve_clip_path(path: Path, group_mode: GroupMode) -> Optional[ClipEntry]
             reel_name=reel_name,
             group_name=group_name,
             source_kind=source_kind,
+            provider_kind="red",
+            manufacturer="RED",
+            format_type="R3D",
             container_path=candidate.parent,
             package_path=package_path,
             segment_count=segment_count,
             segment_index=segment_index,
+        )
+    if candidate.is_file() and candidate.suffix.lower() in GENERIC_VIDEO_EXTENSIONS:
+        clip_name = candidate.stem
+        reel_name = _derive_reel_name(clip_name)
+        group_name = _derive_group_name(candidate, candidate.parent, reel_name, group_mode)
+        provider_kind = provider_kind_for_path(candidate)
+        source_kind: Literal["video", "braw"] = "braw" if provider_kind == "braw" else "video"
+        return ClipEntry(
+            source_path=candidate,
+            clip_name=clip_name,
+            reel_name=reel_name,
+            group_name=group_name,
+            source_kind=source_kind,
+            provider_kind=provider_kind,
+            manufacturer=_manufacturer_for_provider(provider_kind),
+            format_type=candidate.suffix.lstrip(".").upper() or "Video",
+            container_path=candidate.parent,
+            package_path=None,
         )
     if candidate.is_dir() and _is_rdc_dir(candidate):
         return _resolve_rdc_package(candidate, group_mode)
@@ -303,6 +370,9 @@ def _resolve_rdc_package(path: Path, group_mode: GroupMode) -> ClipEntry:
         reel_name=reel_name,
         group_name=group_name,
         source_kind="rdc",
+        provider_kind="red",
+        manufacturer="RED",
+        format_type="R3D",
         container_path=package_path,
         package_path=package_path,
         segment_count=len(segments),
@@ -324,11 +394,12 @@ def _choose_primary_segment(segments: List[Path]) -> Path:
     return segments[0]
 
 
-def _build_output_name(clip: ClipEntry, index: int) -> str:
-    parts = clip.clip_name.split("_")
-    if len(parts) >= 2:
-        return f"{index:03d}_{parts[0]}_{parts[1]}.jpg"
-    return f"{index:03d}_{clip.clip_name}.jpg"
+def _build_output_name(clip: ClipEntry, clip_fields: ClipOrganization, index: int) -> str:
+    label = clip_fields.camera_label.strip() or clip.clip_name
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_")
+    if not normalized:
+        normalized = clip.clip_name
+    return f"{index:03d}_{normalized}.jpg"
 
 
 def _derive_group_name(source_path: Path, container_path: Path, reel_name: str, group_mode: GroupMode) -> str:
@@ -339,6 +410,21 @@ def _derive_group_name(source_path: Path, container_path: Path, reel_name: str, 
     if group_mode == "reel_prefix":
         return reel_name
     return "renders"
+
+
+def _default_camera_label(clip_name: str) -> str:
+    parts = clip_name.split("_")
+    if len(parts) >= 2:
+        return f"{parts[0]} {parts[1]}"
+    return clip_name.replace("_", " ")
+
+
+def _manufacturer_for_provider(provider_kind: str) -> str:
+    if provider_kind == "red":
+        return "RED"
+    if provider_kind == "braw":
+        return "Blackmagic"
+    return "Generic Video"
 
 
 def _derive_reel_name(clip_name: str) -> str:

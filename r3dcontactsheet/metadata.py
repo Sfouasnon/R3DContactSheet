@@ -3,12 +3,28 @@
 from __future__ import annotations
 
 import csv
+import os
 import re
+import shlex
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 from typing import Iterable, Optional
+
+
+class RedlineMetadataError(RuntimeError):
+    """Raised when REDline metadata extraction cannot produce trustworthy timing data."""
+
+
+@dataclass(frozen=True)
+class RedlineCommandResult:
+    command: tuple[str, ...]
+    returncode: int
+    stdout: str
+    stderr: str
+    payload_text: str
 
 
 @dataclass(frozen=True)
@@ -25,15 +41,23 @@ class ClipMetadata:
     metadata_ok: bool
     raw_fields: dict[str, str]
     end_timecode: Optional[str] = None
+    manufacturer: str = ""
+    format_type: str = ""
+    provider_name: str = "red"
+    timecode_supported: bool = False
+    sync_eligible: bool = False
+    render_supported: bool = False
+    metadata_error: str = ""
 
 
 def load_clip_metadata(clip_path: Path, redline_exe: str, timeout: float = 20.0) -> ClipMetadata:
     clip_path = clip_path.expanduser().resolve()
-    fields = _load_metadata_fields(clip_path, redline_exe, timeout)
+    executable = _validate_redline_executable(redline_exe)
+    fields = _load_metadata_fields(clip_path, executable, timeout)
     clip_fps = _extract_rate(fields, _FPS_KEYS)
     timecode_base_fps = _extract_rate(fields, _TIMECODE_BASE_KEYS) or clip_fps
     resolution = _extract_resolution(fields)
-    perframe_rows = _load_perframe_csv(clip_path, redline_exe, timeout)
+    perframe_rows, perframe_note = _load_perframe_csv(clip_path, executable, timeout)
     if perframe_rows:
         start_value = _first_tc_from_perframe(perframe_rows)
         end_value = _last_tc_from_perframe(perframe_rows)
@@ -45,7 +69,7 @@ def load_clip_metadata(clip_path: Path, redline_exe: str, timeout: float = 20.0)
         end_value = None
         total_frames = None
         source = "untrusted"
-        print(f"Per-frame metadata unavailable for {clip_path}", flush=True)
+        print(f"Per-frame metadata unavailable for {clip_path}: {perframe_note}", flush=True)
 
     drop_frame = bool(start_value and ";" in start_value)
     metadata_ok = (
@@ -60,7 +84,7 @@ def load_clip_metadata(clip_path: Path, redline_exe: str, timeout: float = 20.0)
     if metadata_ok:
         basis += f" ({source}, clip fps {clip_fps:g}, TC base {timecode_base_fps:g}, TC in {start_value}, TC out {end_value}, frames {total_frames})"
     else:
-        basis += " (incomplete metadata: per-frame timecode unavailable or untrusted)"
+        basis += f" (incomplete metadata: {perframe_note})"
     return ClipMetadata(
         clip_path=clip_path,
         clip_fps=clip_fps,
@@ -74,26 +98,73 @@ def load_clip_metadata(clip_path: Path, redline_exe: str, timeout: float = 20.0)
         sync_basis=basis,
         metadata_ok=metadata_ok,
         raw_fields=fields,
+        manufacturer="RED",
+        format_type="R3D",
+        provider_name="red",
+        timecode_supported=bool(start_value and end_value),
+        sync_eligible=metadata_ok,
+        render_supported=True,
+        metadata_error="" if metadata_ok else perframe_note,
     )
 
 
-def _load_perframe_csv(clip_path: Path, redline_exe: str, timeout: float) -> list[dict[str, str]]:
-    try:
-        result = subprocess.run(
-            [str(redline_exe), "--i", str(clip_path), "--printMeta", "5"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
+def _validate_redline_executable(redline_exe: str | Path) -> Path:
+    path = Path(redline_exe).expanduser().resolve()
+    if not os.path.isfile(path):
+        raise RedlineMetadataError(
+            f"REDline path is not a file: {path}. Choose the REDline binary inside REDCINE-X PRO, not the .app bundle."
         )
-    except Exception:
-        return []
-    payload = (result.stdout or "").strip()
+    if not os.access(path, os.X_OK):
+        raise RedlineMetadataError(f"REDline path is not executable: {path}")
+    return path
+
+
+def _load_perframe_csv(clip_path: Path, redline_exe: Path, timeout: float) -> tuple[list[dict[str, str]], str]:
+    try:
+        result = _run_redline_printmeta(clip_path, redline_exe, "5", timeout)
+    except RedlineMetadataError as exc:
+        return [], str(exc)
+
+    payload = result.payload_text
     if not payload:
-        payload = (result.stderr or "").strip()
-    if not payload:
-        return []
-    return _parse_perframe_csv(payload)
+        return [], _format_redline_failure(
+            clip_path,
+            result,
+            "REDline returned no per-frame CSV output.",
+        )
+
+    temp_csv_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="r3dcontactsheet_printmeta5_",
+            suffix=".csv",
+            delete=False,
+            mode="w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(payload)
+            temp_csv_path = Path(handle.name)
+        if temp_csv_path is None or not temp_csv_path.exists() or temp_csv_path.stat().st_size == 0:
+            return [], _format_redline_failure(
+                clip_path,
+                result,
+                "REDline per-frame CSV capture file was not created or was empty.",
+            )
+        rows = _parse_perframe_csv(temp_csv_path.read_text(encoding="utf-8"))
+    finally:
+        if temp_csv_path and temp_csv_path.exists():
+            try:
+                temp_csv_path.unlink()
+            except OSError:
+                pass
+
+    if not rows:
+        return [], _format_redline_failure(
+            clip_path,
+            result,
+            "REDline per-frame CSV contained no usable frame rows.",
+        )
+    return rows, ""
 
 
 def _parse_perframe_csv(text: str) -> list[dict[str, str]]:
@@ -163,22 +234,70 @@ def _last_tc_from_perframe(rows: list[dict[str, str]]) -> Optional[str]:
     return _extract_tc_value(rows[-1].get(tc_key, ""))
 
 
-def _load_metadata_fields(clip_path: Path, redline_exe: str, timeout: float) -> dict[str, str]:
+def _load_metadata_fields(clip_path: Path, redline_exe: Path, timeout: float) -> dict[str, str]:
     merged: dict[str, str] = {}
     for mode in ("3", "1"):
-        result = subprocess.run(
-            [str(redline_exe), "--i", str(clip_path), "--printMeta", mode, "--silent"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-        payload = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+        try:
+            result = _run_redline_printmeta(clip_path, redline_exe, mode, timeout, silent=True)
+        except RedlineMetadataError as exc:
+            print(f"REDline metadata mode {mode} failed for {clip_path}: {exc}", flush=True)
+            continue
+        payload = result.payload_text
         parsed = parse_redline_printmeta(payload)
         for key, value in parsed.items():
             if key not in merged or not merged[key]:
                 merged[key] = value
     return merged
+
+
+def _run_redline_printmeta(
+    clip_path: Path,
+    redline_exe: Path,
+    mode: str,
+    timeout: float,
+    *,
+    silent: bool = False,
+) -> RedlineCommandResult:
+    command = [str(redline_exe), "--i", str(clip_path), "--printMeta", str(mode)]
+    if silent:
+        command.append("--silent")
+    print(f"REDline metadata command: {shlex.join(command)}", flush=True)
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=os.environ.copy(),
+        )
+    except Exception as exc:
+        raise RedlineMetadataError(f"Failed to execute REDline metadata command for {clip_path}: {exc}") from exc
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    payload = stdout or stderr
+    print(f"REDline metadata return code ({mode}) for {clip_path.name}: {result.returncode}", flush=True)
+    if stdout and (mode == "5" or result.returncode != 0):
+        print(f"REDline metadata stdout ({mode}) for {clip_path.name}:\n{stdout}", flush=True)
+    if stderr:
+        print(f"REDline metadata stderr ({mode}) for {clip_path.name}:\n{stderr}", flush=True)
+    return RedlineCommandResult(
+        command=tuple(command),
+        returncode=result.returncode,
+        stdout=stdout,
+        stderr=stderr,
+        payload_text=payload,
+    )
+
+
+def _format_redline_failure(clip_path: Path, result: RedlineCommandResult, reason: str) -> str:
+    details = [reason, f"Clip: {clip_path}", f"Command: {shlex.join(result.command)}", f"Return code: {result.returncode}"]
+    if result.stderr:
+        details.append(f"stderr: {result.stderr}")
+    elif result.stdout:
+        details.append(f"stdout: {result.stdout}")
+    return " | ".join(details)
 
 
 def parse_redline_printmeta(text: str) -> dict[str, str]:

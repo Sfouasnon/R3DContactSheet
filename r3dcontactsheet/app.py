@@ -12,9 +12,10 @@ import time
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import QCoreApplication, QTimer, Qt, QUrl
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QPalette, QPixmap
+from PySide6.QtCore import QCoreApplication, QRect, QTimer, Qt, QUrl
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QImage, QPalette, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -41,15 +42,17 @@ from PySide6.QtWidgets import (
 
 from .batch import (
     BatchOptions,
+    ClipOrganization,
     PreviewContext,
     build_job_plan_from_context,
     build_preview_context,
     describe_source_selection,
-    discover_r3d_clips,
+    discover_media_clips,
 )
 from .contact_sheet import ContactSheetItem, build_contact_sheet_pdf
 from .frame_index import FrameTargetRequest, MatchSelectionState, OverlapSubset, _timecode_for_absolute_frame
-from .redline import RedlinePaths, RenderSettings, probe_redline, render_frame, shell_join, write_batch_file
+from .media_render import build_replay_command, render_plan_item
+from .redline import RedlinePaths, RenderSettings, probe_redline, shell_join
 from .settings import AppSettings, SettingsStore
 
 APP_TITLE = "R3D Contact Sheet"
@@ -81,6 +84,8 @@ class MainWindow(QMainWindow):
         self.active_subset: OverlapSubset | None = None
         self.current_selection: MatchSelectionState = MatchSelectionState(None, None, "auto")
         self.redline_ready = False
+        self.preview_table_updating = False
+        self._last_probe_log_message: str | None = None
 
         self._build_ui()
         self._apply_settings_to_ui()
@@ -148,8 +153,8 @@ class MainWindow(QMainWindow):
         header_row = QHBoxLayout()
         header_row.setSpacing(12)
         logo_label = QLabel()
-        logo_label.setFixedSize(260, 52)
-        logo_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        logo_label.setFixedSize(520, 112)
+        logo_label.setAlignment(Qt.AlignCenter)
         logo_pixmap = self._load_header_logo(logo_label.size().width(), logo_label.size().height())
         if not logo_pixmap.isNull():
             logo_label.setPixmap(logo_pixmap)
@@ -196,7 +201,7 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(source_button_row, 2, 0, 1, 3)
 
         source_help = QLabel(
-            "Point the app at the media parent folder. The app scans .RDC packages and standalone .R3D clips automatically."
+            "Point the app at the media parent folder. The app scans RED clips plus common video files, then normalizes what each provider can truthfully support."
         )
         source_help.setWordWrap(True)
         source_help.setObjectName("muted")
@@ -254,7 +259,20 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(box)
         layout.setSpacing(10)
 
-        intro = QLabel("The app now builds overlap groups from clip metadata LTC ranges, then chooses the best reference frame for the strongest overlapping subset.")
+        mode_row = QGridLayout()
+        mode_row.setHorizontalSpacing(10)
+        mode_row.addWidget(QLabel("Mode"), 0, 0)
+        self.sync_mode_combo = QComboBox()
+        self.sync_mode_combo.addItems(["Sync On", "Sync Off"])
+        mode_row.addWidget(self.sync_mode_combo, 0, 1)
+        mode_row.addWidget(QLabel("Theme"), 0, 2)
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["Dark", "Light"])
+        mode_row.addWidget(self.theme_combo, 0, 3)
+        mode_row.setColumnStretch(5, 1)
+        layout.addLayout(mode_row)
+
+        intro = QLabel("Sync On keeps the technical overlap diagnostics visible. Sync Off still chooses coherent frames quietly, but the contact sheet suppresses written sync warnings for presentation use.")
         intro.setWordWrap(True)
         intro.setObjectName("muted")
         layout.addWidget(intro)
@@ -372,7 +390,7 @@ class MainWindow(QMainWindow):
         self.alphabetize_check = QCheckBox("Alphabetize clips")
         top_row.addWidget(self.alphabetize_check)
         top_row.addSpacing(12)
-        prompt = QLabel("Preview is the sync check. Review LTC in/out, per-clip match frame, match timecode, and status before building the contact sheet PDF.")
+        prompt = QLabel("Preview is the sync check. Edit camera labels and grouping here, then review LTC in/out, per-clip match frame, match timecode, and status before building the contact sheet PDF.")
         prompt.setObjectName("muted")
         top_row.addWidget(prompt, 1)
         preview_action_column = QVBoxLayout()
@@ -464,13 +482,30 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(analysis_row)
 
-        self.preview_table = QTableWidget(0, 10)
+        self.preview_table = QTableWidget(0, 14)
         self.preview_table.setHorizontalHeaderLabels(
-            ["Clip", "Group", "FPS", "Source TC In", "Source TC Out", "Clip Frame", "Match Timecode", "Match Status", "Range Relation", "Sync Basis"]
+            [
+                "Camera Label",
+                "Group",
+                "Subgroup",
+                "Manufacturer",
+                "Format",
+                "Clip",
+                "FPS",
+                "Source TC In",
+                "Source TC Out",
+                "Clip Frame",
+                "Match Timecode",
+                "Match Status",
+                "Range Relation",
+                "Sync Basis",
+            ]
         )
         self.preview_table.horizontalHeader().setStretchLastSection(True)
         self.preview_table.verticalHeader().setVisible(False)
-        self.preview_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.preview_table.setEditTriggers(
+            QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked | QAbstractItemView.EditKeyPressed
+        )
         self.preview_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.preview_table.setAlternatingRowColors(True)
         layout.addWidget(self.preview_table, 1)
@@ -545,6 +580,9 @@ class MainWindow(QMainWindow):
         self.group_mode_combo.currentTextChanged.connect(self._refresh_source_state)
         self.custom_group_edit.textChanged.connect(lambda *_: self._refresh_source_state())
         self.alphabetize_check.stateChanged.connect(lambda *_: self._refresh_source_state())
+        self.sync_mode_combo.currentTextChanged.connect(lambda *_: self._refresh_frame_mode_summary())
+        self.theme_combo.currentTextChanged.connect(lambda *_: self._refresh_frame_mode_summary())
+        self.preview_table.itemChanged.connect(self._on_preview_table_item_changed)
 
         for widget in (self.target_timecode_edit, self.fps_edit):
             widget.textChanged.connect(self._refresh_frame_mode_summary)
@@ -574,6 +612,8 @@ class MainWindow(QMainWindow):
         self.custom_group_edit.setText(getattr(self.settings, "custom_group_name", ""))
         self.alphabetize_check.setChecked(self.settings.alphabetize)
         self.metadata_mode_check.setChecked(self.settings.metadata_mode)
+        self.sync_mode_combo.setCurrentText("Sync Off" if getattr(self.settings, "sync_mode", "sync_on") == "sync_off" else "Sync On")
+        self.theme_combo.setCurrentText("Light" if getattr(self.settings, "theme_name", "dark") == "light" else "Dark")
 
     def _choose_redline(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Choose REDline executable")
@@ -654,9 +694,9 @@ class MainWindow(QMainWindow):
             self.source_detail_label.setText("")
             return
         try:
-            clips = discover_r3d_clips(path, group_mode=self.group_mode_combo.currentText(), alphabetize=self.alphabetize_check.isChecked())  # type: ignore[arg-type]
+            clips = discover_media_clips(path, group_mode=self.group_mode_combo.currentText(), alphabetize=self.alphabetize_check.isChecked())  # type: ignore[arg-type]
             if path.is_file():
-                mode_text = "Single R3D"
+                mode_text = "Single clip"
             elif path.suffix.lower() == ".rdc":
                 mode_text = "RDC package"
             else:
@@ -666,8 +706,9 @@ class MainWindow(QMainWindow):
             )
             reel_group = self._display_group_value(self._logical_common_value([clip.clip_name.split("_")[0] for clip in clips]))
             clip_group = self._display_group_value(self._logical_common_value([clip.clip_name.split("_")[1] for clip in clips if "_" in clip.clip_name]))
+            providers = sorted({clip.provider_kind for clip in clips})
             self.source_detail_label.setText(
-                f"Selected path: {path}. Reel group: {reel_group}. Clip group: {clip_group}. Alphabetized: {'Yes' if self.alphabetize_check.isChecked() else 'No'}."
+                f"Selected path: {path}. Reel group: {reel_group}. Clip group: {clip_group}. Providers: {', '.join(providers)}. Alphabetized: {'Yes' if self.alphabetize_check.isChecked() else 'No'}."
             )
         except Exception as exc:
             self.source_count_label.setText(str(exc))
@@ -676,14 +717,22 @@ class MainWindow(QMainWindow):
     def _refresh_frame_mode_summary(self) -> None:
         tc_text = self.target_timecode_edit.text().strip()
         fps_text = self.fps_edit.text().strip()
+        mode_text = self.sync_mode_combo.currentText()
         if self.advanced_timecode_check.isChecked() and tc_text:
             drop_text = "drop-frame" if self.drop_frame_check.isChecked() else "non-drop-frame"
             fps_summary = fps_text if fps_text else "clip metadata FPS auto-detect"
             self.frame_mode_label.setText(
-                f"Requested matching moment: {tc_text}. Timecode basis: {fps_summary} ({drop_text})."
+                f"{mode_text}: requested matching moment {tc_text}. Timecode basis: {fps_summary} ({drop_text})."
             )
             return
-        self.frame_mode_label.setText("Matching moment will be resolved automatically from clip metadata across all selected clips.")
+        if mode_text == "Sync Off":
+            self.frame_mode_label.setText(
+                f"Sync Off: the app will still choose coherent frames quietly, but the contact sheet suppresses written sync diagnostics. Theme: {self.theme_combo.currentText()}."
+            )
+        else:
+            self.frame_mode_label.setText(
+                f"Sync On: matching moment will be resolved automatically from truthful clip metadata across sync-eligible clips. Theme: {self.theme_combo.currentText()}."
+            )
 
     def _toggle_advanced_timecode(self, enabled: bool) -> None:
         self.advanced_timecode_panel.setVisible(enabled)
@@ -699,35 +748,42 @@ class MainWindow(QMainWindow):
         if probe.available and probe.executable:
             self._set_path_field(self.redline_edit, str(probe.executable))
         self.redline_ready = bool(probe.available and probe.compatible and probe.executable)
-        self.preview_button.setEnabled(self.redline_ready)
-        self.run_button.setEnabled(self.redline_ready)
+        self.preview_button.setEnabled(True)
+        self.run_button.setEnabled(True)
         if probe.available and probe.executable:
             self.redline_state_label.setText("REDline found and executable." if probe.compatible else "REDline found, but this build needs a newer REDCINE-X / REDline.")
-            self.redline_path_label.setText(f"Path: {probe.executable}")
+            self.redline_path_label.setText(f"REDline path: {probe.executable}")
+        elif probe.bundle_selected and probe.bundle_path is not None:
+            self.redline_state_label.setText("REDCINE-X application bundle selected, but the REDline CLI binary was not resolved.")
+            self.redline_path_label.setText(
+                f"Bundle: {probe.bundle_path}. Choose the REDline executable inside Contents/MacOS instead of the .app bundle itself."
+            )
+        elif explicit is not None:
+            self.redline_state_label.setText("Selected REDline path is not a valid executable.")
+            self.redline_path_label.setText(f"Path: {explicit}")
         else:
-            self.redline_state_label.setText("REDline not found. R3DContactSheet requires REDCINE-X PRO to be installed before preview or render can run.")
+            self.redline_state_label.setText("REDline not found. RED clips require REDCINE-X PRO, but generic video preview can still work if metadata and rendering tools are available.")
             self.redline_path_label.setText("Path: Set REDline manually with Choose REDline after installing REDCINE-X PRO.")
         self.config_status_label.setText(self.store.last_status)
         if probe.available and probe.compatible:
             self._set_health_state("yellow", "REDline ready. Preview a source to verify metadata and matched-frame sync.")
+        elif probe.bundle_selected:
+            self._set_health_state("red", "A REDCINE-X app bundle was selected, but the REDline CLI binary was not resolved.")
         else:
-            self._set_health_state("red", "REDline unavailable or too old for the verified render path.")
-        if probe.available and not probe.compatible:
-            self._append_log(probe.message)
-        if not probe.available:
-            self._append_log(probe.message)
+            self._set_health_state("yellow", "REDline unavailable for RED media. Generic video support remains best-effort.")
+        self._log_probe_message_once(probe.message)
 
     def _build_preview_context(self) -> PreviewContext:
         input_path = self._validate_input_path()
         output_path = self._validate_output_path()
-        redline_path = self._validate_redline_path()
         frame_request = self._build_frame_request()
         settings = self._build_render_settings()
-        clips = discover_r3d_clips(
+        clips = discover_media_clips(
             input_path,
             group_mode=self.group_mode_combo.currentText(),  # type: ignore[arg-type]
             alphabetize=self.alphabetize_check.isChecked(),
         )
+        redline_path = self._validate_redline_path() if any(clip.provider_kind == "red" for clip in clips) else None
         options = BatchOptions(
             output_dir=output_path,
             frame_request=frame_request,
@@ -735,13 +791,19 @@ class MainWindow(QMainWindow):
             group_mode=self.group_mode_combo.currentText(),  # type: ignore[arg-type]
             alphabetize=self.alphabetize_check.isChecked(),
             custom_group_name=self.custom_group_edit.text().strip() or None,
-            redline_exe=str(redline_path),
+            redline_exe=str(redline_path) if redline_path else None,
+            sync_mode="sync_off" if self.sync_mode_combo.currentText() == "Sync Off" else "sync_on",
         )
-        self._append_log(f"Using REDline: {redline_path}")
+        if redline_path:
+            self._append_log(f"Using REDline: {redline_path}")
         self._append_log(f"Resolved {len(clips)} clip(s) from {input_path}")
         self.last_contact_sheet_pdf = None
         self.run_button.setText("Build Contact Sheet PDF")
-        return build_preview_context(clips, options)
+        context = build_preview_context(clips, options)
+        for metadata in context.metadata_by_clip.values():
+            if metadata.metadata_error:
+                self._append_log(metadata.metadata_error)
+        return context
 
     def _apply_preview_context(self, context: PreviewContext) -> None:
         self.preview_context = context
@@ -977,9 +1039,9 @@ class MainWindow(QMainWindow):
         for index, item in enumerate(self.plan, start=1):
             started = time.time()
             try:
-                result = render_frame(
-                    item.render_job,
-                    redline_exe=self.redline_edit.text(),
+                result = render_plan_item(
+                    item,
+                    redline_exe=self.redline_edit.text().strip() or None,
                     min_output_bytes=MIN_OUTPUT_BYTES,
                 )
                 command_text = shell_join(result.command)
@@ -990,7 +1052,7 @@ class MainWindow(QMainWindow):
                         {
                             "index": index,
                             "command": command_text,
-                            "output": str(result.job.output_file),
+                            "output": str(getattr(result, "job", None).output_file if getattr(result, "job", None) else result.output_path),
                             "size": result.output_size,
                             "duration": duration,
                         },
@@ -1081,13 +1143,19 @@ class MainWindow(QMainWindow):
                 self.run_button.setText("Open Contact Sheet")
 
     def _render_plan(self) -> None:
+        self.preview_table_updating = True
         self.preview_table.setRowCount(len(self.plan))
         sync_mode = self._plan_sync_mode(self.plan)
         for row, item in enumerate(self.plan):
             sync_status = self._sync_status_text(item, sync_mode)
+            fields = item.clip_fields
             values = (
+                fields.camera_label or self._display_clip_label(item.clip.clip_name),
+                fields.group_name or item.output_group,
+                fields.subgroup_name or "",
+                fields.manufacturer or item.clip_metadata.manufacturer or item.clip.manufacturer or "Unknown",
+                fields.format_type or item.clip_metadata.format_type or item.clip.format_type or "Unknown",
                 item.clip.clip_name,
-                item.output_group,
                 self._preview_fps_text(item),
                 item.frame_resolution.source_timecode_in or "Unavailable",
                 item.frame_resolution.source_timecode_out or "Unavailable",
@@ -1099,11 +1167,17 @@ class MainWindow(QMainWindow):
             )
             for column, value in enumerate(values):
                 table_item = QTableWidgetItem(value)
-                if column == 7:
+                table_item.setData(Qt.UserRole, str(item.clip.source_path))
+                if column in {0, 1, 2, 3, 4}:
+                    table_item.setFlags(table_item.flags() | Qt.ItemIsEditable)
+                else:
+                    table_item.setFlags(table_item.flags() & ~Qt.ItemIsEditable)
+                if column == 11:
                     self._style_status_item(table_item, sync_status)
                 self.preview_table.setItem(row, column, table_item)
         self.preview_table.resizeColumnsToContents()
         self.summary_label.setText(self._sync_summary_text(sync_mode))
+        self.preview_table_updating = False
 
     def _build_plan(self):
         if self.preview_context:
@@ -1111,6 +1185,31 @@ class MainWindow(QMainWindow):
         context = self._build_preview_context()
         self.preview_context = context
         return build_job_plan_from_context(context, context.selection)
+
+    def _on_preview_table_item_changed(self, item: QTableWidgetItem) -> None:
+        if self.preview_table_updating or not self.preview_context:
+            return
+        path_text = item.data(Qt.UserRole)
+        if not path_text:
+            return
+        clip_path = Path(path_text)
+        fields = self.preview_context.clip_fields.get(clip_path)
+        if fields is None:
+            return
+        value = item.text().strip()
+        if item.column() == 0:
+            fields.camera_label = value
+        elif item.column() == 1:
+            fields.group_name = value
+        elif item.column() == 2:
+            fields.subgroup_name = value
+        elif item.column() == 3:
+            fields.manufacturer = value
+        elif item.column() == 4:
+            fields.format_type = value
+        else:
+            return
+        self._refresh_plan_from_selection(write_replay=False)
 
     def _build_frame_request(self) -> FrameTargetRequest:
         tc_text = self.target_timecode_edit.text().strip() if self.advanced_timecode_check.isChecked() else ""
@@ -1171,25 +1270,24 @@ class MainWindow(QMainWindow):
         if not value:
             raise ValueError("Choose a REDline executable.")
         path = Path(value).expanduser().resolve()
-        if not path.exists():
-            raise ValueError(f"REDline executable does not exist: {path}")
-        if not os.access(path, os.X_OK):
-            raise ValueError(f"REDline executable is not runnable: {path}")
         probe = probe_redline(RedlinePaths(explicit_path=path))
         if not probe.available:
             raise ValueError(probe.message)
         if not probe.compatible:
             raise ValueError(probe.message)
-        return path
+        if not probe.executable:
+            raise ValueError("REDline validation succeeded without a resolved executable path, which should not happen.")
+        return probe.executable
 
     def _write_replay_script(self, plan) -> Path:
         output_dir = self._validate_output_path()
         replay_path = output_dir / REPLAY_SCRIPT_NAME
-        write_batch_file(
-            [item.render_job for item in plan],
-            replay_path,
-            redline_exe=self.redline_edit.text().strip(),
+        commands = [build_replay_command(item, redline_exe=self.redline_edit.text().strip() or None) for item in plan]
+        replay_path.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\n" + "\n".join(shell_join(command) for command in commands) + "\n",
+            encoding="utf-8",
         )
+        replay_path.chmod(replay_path.stat().st_mode | 0o111)
         return replay_path
 
     def _preview_fps_text(self, item) -> str:
@@ -1202,7 +1300,7 @@ class MainWindow(QMainWindow):
         tc_source = item.clip_metadata.timecode_source or "unknown source"
         fps = item.clip_metadata.clip_fps
         tc_base = item.clip_metadata.timecode_base_fps
-        bits = [tc_source]
+        bits = [item.clip_metadata.provider_name.upper(), tc_source]
         if fps is not None:
             bits.append(f"clip {fps:g} fps")
         if tc_base is not None:
@@ -1213,8 +1311,10 @@ class MainWindow(QMainWindow):
         return " | ".join(bits)
 
     def _sync_status_text(self, item, sync_mode: str) -> str:
-        if not item.clip_metadata.metadata_ok:
-            return "Metadata incomplete: clip FPS or start timecode missing"
+        if not item.clip_metadata.sync_eligible:
+            if item.clip_metadata.metadata_error:
+                return item.clip_metadata.metadata_error
+            return "Metadata incomplete: clip timing is not sync-eligible"
         if item.frame_resolution.match_frame is None or not item.frame_resolution.match_timecode:
             return "Metadata incomplete"
         if item.frame_resolution.sync_status == "exact_match":
@@ -1257,16 +1357,28 @@ class MainWindow(QMainWindow):
     def _build_contact_sheet_pdf(self) -> Path:
         output_dir = self._validate_output_path()
         sync_mode = self._plan_sync_mode(self.plan)
+        presentation_mode = self.sync_mode_combo.currentText() == "Sync Off"
         items = []
-        for item in self.plan:
+        sorted_plan = sorted(
+            self.plan,
+            key=lambda item: (
+                (item.clip_fields.group_name or item.output_group or "Uncategorized").lower(),
+                (item.clip_fields.subgroup_name or "").lower(),
+                (item.clip_fields.camera_label or item.clip.clip_name).lower(),
+            ),
+        )
+        for item in sorted_plan:
             image_path = item.output_file
             if not image_path.exists() or image_path.stat().st_size < MIN_OUTPUT_BYTES:
                 continue
+            display_group = item.clip_fields.group_name.strip() or item.output_group or "Uncategorized"
+            display_subgroup = item.clip_fields.subgroup_name.strip()
             items.append(
                 ContactSheetItem(
                     image_path=image_path,
-                    clip_label=self._display_clip_label(item.clip.clip_name),
-                    group_label=item.output_group,
+                    clip_label=item.clip_fields.camera_label.strip() or self._display_clip_label(item.clip.clip_name),
+                    group_label=display_group,
+                    subgroup_label=display_subgroup,
                     frame_label=(
                         f"Frame {item.frame_resolution.frame_index}"
                         if item.frame_resolution.frame_index is not None
@@ -1275,31 +1387,37 @@ class MainWindow(QMainWindow):
                     timecode_label=item.frame_resolution.match_timecode or "Unavailable",
                     fps_label=(f"{item.clip_metadata.clip_fps:g} fps" if item.clip_metadata.clip_fps is not None else "FPS unknown"),
                     resolution_label=((item.clip_metadata.resolution or "Resolution unknown").replace("x", " × ")),
-                    sync_label=self._display_sync_caption(self._sync_status_text(item, sync_mode)),
+                    sync_label="" if presentation_mode else self._display_sync_caption(self._sync_status_text(item, sync_mode)),
                 )
             )
         if not items:
             raise ValueError("No valid rendered stills were available for contact sheet PDF generation.")
-        overlap_group = self._display_overlap_group(self.plan)
         subset = self._current_active_subset()
         common_fps = self._common_value([f"{item.clip_metadata.clip_fps:g}" for item in self.plan if item.clip_metadata.clip_fps is not None])
         common_resolution = self._common_value([item.clip_metadata.resolution for item in self.plan if item.clip_metadata.resolution])
-        common_reel = self._display_group_value(self._logical_common_value([item.clip.clip_name.split("_")[0] for item in self.plan]))
-        common_group = self._display_group_value(self._logical_common_value([item.clip.clip_name.split("_")[1] for item in self.plan if "_" in item.clip.clip_name]))
+        grouping_summary = self._sheet_grouping_summary(self.plan)
         header_lines = [
-            f"Overlap group: Reel {common_reel} • Clip {common_group}" if common_reel != "Mixed" and common_group != "Mixed" else f"Overlap group: {overlap_group}",
-            f"Sync mode: {'Exact' if sync_mode == 'full' else 'Partial' if sync_mode == 'partial' else 'No common moment'}",
+            grouping_summary,
+            f"Mode: {'Presentation' if presentation_mode else 'Technical Sync'}",
             (
-                f"Shared frame: {self._current_match_timecode_label()} • {subset.start_timecode} → {subset.end_timecode}"
-                if subset is not None and sync_mode != 'none'
-                else "No universal common frame across all clips"
+                "Frames selected automatically from the strongest usable overlap or each clip's middle region."
+                if presentation_mode
+                else (
+                    f"Shared match: {self._current_match_timecode_label()} • {subset.start_timecode} → {subset.end_timecode}"
+                    if subset is not None and sync_mode != "none"
+                    else "No universal common frame across all clips"
+                )
             ),
-            (
-                f"{common_fps or 'mixed'} fps • {(common_resolution or 'mixed or unavailable').replace('x', '×')} • {len(self.plan)} cameras"
-            ),
+            f"{common_fps or 'mixed'} fps • {(common_resolution or 'mixed or unavailable').replace('x', '×')} • {len(self.plan)} cameras",
         ]
         destination = output_dir / CONTACT_SHEET_NAME
-        return build_contact_sheet_pdf(items, destination, "R3DContactSheet", header_lines=header_lines)
+        return build_contact_sheet_pdf(
+            items,
+            destination,
+            "R3DContactSheet",
+            header_lines=header_lines,
+            theme_name=self.theme_combo.currentText().strip().lower(),
+        )
 
     def _update_health_from_plan(self, plan) -> None:
         if not plan:
@@ -1387,8 +1505,22 @@ class MainWindow(QMainWindow):
             return f"Reel {reel} • Clip {clip}"
         return "Mixed"
 
+    def _sheet_grouping_summary(self, plan) -> str:
+        groups = sorted({(item.clip_fields.group_name or item.output_group or "Uncategorized") for item in plan})
+        if len(groups) == 1:
+            group_text = groups[0]
+        else:
+            group_text = ", ".join(groups[:3]) + ("…" if len(groups) > 3 else "")
+        subgroups = sorted({item.clip_fields.subgroup_name for item in plan if item.clip_fields.subgroup_name})
+        if len(subgroups) == 1:
+            return f"Group: {group_text} • Subgroup: {subgroups[0]}"
+        if len(subgroups) > 1:
+            subgroup_text = ", ".join(subgroups[:3]) + ("…" if len(subgroups) > 3 else "")
+            return f"Group: {group_text} • Subgroups: {subgroup_text}"
+        return f"Group: {group_text}"
+
     def _set_preview_busy(self, busy: bool, text: str | None = None) -> None:
-        self.preview_button.setDisabled(busy or not self.redline_ready)
+        self.preview_button.setDisabled(busy)
         self.preview_button.setText((text or self._preview_idle_text) if busy else self._preview_idle_text)
         if busy:
             self.preview_button.setStyleSheet(
@@ -1447,6 +1579,8 @@ class MainWindow(QMainWindow):
             custom_group_name=self.custom_group_edit.text().strip(),
             alphabetize=self.alphabetize_check.isChecked(),
             metadata_mode=self.metadata_mode_check.isChecked(),
+            sync_mode="sync_off" if self.sync_mode_combo.currentText() == "Sync Off" else "sync_on",
+            theme_name=self.theme_combo.currentText().strip().lower(),
         )
         self.store.save(settings)
         self.config_status_label.setText(self.store.last_status)
@@ -1468,7 +1602,34 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap(str(logo_path))
         if pixmap.isNull():
             return QPixmap()
-        return pixmap.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        trimmed = self._trim_pixmap_transparency(pixmap)
+        return trimmed.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+    def _trim_pixmap_transparency(self, pixmap: QPixmap) -> QPixmap:
+        image = pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
+        width = image.width()
+        height = image.height()
+        left = width
+        right = -1
+        top = height
+        bottom = -1
+        for y in range(height):
+            for x in range(width):
+                if image.pixelColor(x, y).alpha() > 10:
+                    left = min(left, x)
+                    right = max(right, x)
+                    top = min(top, y)
+                    bottom = max(bottom, y)
+        if right < left or bottom < top:
+            return pixmap
+        rect = QRect(left, top, right - left + 1, bottom - top + 1)
+        return pixmap.copy(rect)
+
+    def _log_probe_message_once(self, message: str) -> None:
+        if not message or message == self._last_probe_log_message:
+            return
+        self._last_probe_log_message = message
+        self._append_log(message)
 
     def _log_startup_banner(self) -> None:
         self._append_log(f"STARTUP: {BUILD_MARKER}")

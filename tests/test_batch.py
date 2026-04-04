@@ -55,6 +55,20 @@ class BatchDiscoveryTests(unittest.TestCase):
             self.assertIn("Selected RDC package", description)
             self.assertIn("2 segments", description)
 
+    def test_folder_scan_includes_generic_video_sources(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "Witness_A" / "cam01.mov"
+            video.parent.mkdir(parents=True)
+            video.write_text("video")
+
+            clips = discover_r3d_clips(root, group_mode="parent_folder")
+
+            self.assertEqual(len(clips), 1)
+            self.assertEqual(clips[0].provider_kind, "video")
+            self.assertEqual(clips[0].source_kind, "video")
+            self.assertEqual(clips[0].group_name, "Witness_A")
+
 
 class ReplayScriptTests(unittest.TestCase):
     def test_replay_script_uses_verified_render_flags_with_metadata(self):
@@ -84,9 +98,9 @@ class ReplayScriptTests(unittest.TestCase):
             self.assertIn("--gammaCurve 32", contents)
             self.assertIn("--useMeta", contents)
 
-    @patch("r3dcontactsheet.batch.load_clip_metadata")
-    def test_custom_group_name_overrides_clip_group(self, mock_load_clip_metadata):
-        self._configure_mock_metadata(mock_load_clip_metadata)
+    @patch("r3dcontactsheet.batch.load_provider_metadata")
+    def test_custom_group_name_overrides_clip_group(self, mock_load_provider_metadata):
+        self._configure_mock_metadata(mock_load_provider_metadata)
         with tempfile.TemporaryDirectory() as tmpdir:
             clip = Path(tmpdir) / "A003_A001_0127R2_001.R3D"
             clip.write_text("clip")
@@ -106,8 +120,8 @@ class ReplayScriptTests(unittest.TestCase):
             self.assertIn("/frames/", str(plan[0].output_file))
             self.assertTrue(plan[0].output_file.name.startswith("001_A003_A001"))
 
-    def _configure_mock_metadata(self, mock_load_clip_metadata):
-        mock_load_clip_metadata.return_value = ClipMetadata(
+    def _configure_mock_metadata(self, mock_load_provider_metadata):
+        mock_load_provider_metadata.return_value = ClipMetadata(
             clip_path=Path("/tmp/mock.R3D"),
             clip_fps=23.976,
             timecode_base_fps=23.976,
@@ -119,6 +133,13 @@ class ReplayScriptTests(unittest.TestCase):
             sync_basis="REDline printMeta",
             metadata_ok=True,
             raw_fields={},
+            end_timecode="15:07:03:20",
+            manufacturer="RED",
+            format_type="R3D",
+            provider_name="red",
+            timecode_supported=True,
+            sync_eligible=True,
+            render_supported=True,
         )
 
 

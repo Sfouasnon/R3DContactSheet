@@ -13,7 +13,7 @@ import sys
 from glob import glob
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 
 class RedlineError(RuntimeError):
@@ -120,6 +120,10 @@ class RedlineProbe:
     compatible: bool
     message: str
     help_text: str = ""
+    selected_path: Optional[Path] = None
+    bundle_path: Optional[Path] = None
+    bundle_selected: bool = False
+    resolution_note: str = ""
 
 
 def find_redline(paths: Optional[RedlinePaths] = None) -> Path:
@@ -127,11 +131,15 @@ def find_redline(paths: Optional[RedlinePaths] = None) -> Path:
     candidates: List[Path] = []
 
     if paths.explicit_path:
-        candidates.append(Path(paths.explicit_path).expanduser())
+        explicit_candidate, _, _ = _resolve_redline_candidate(Path(paths.explicit_path).expanduser())
+        if explicit_candidate is not None:
+            candidates.append(explicit_candidate)
 
     env_value = os.getenv(paths.env_var_name)
     if env_value:
-        candidates.append(Path(env_value).expanduser())
+        env_candidate, _, _ = _resolve_redline_candidate(Path(env_value).expanduser())
+        if env_candidate is not None:
+            candidates.append(env_candidate)
 
     if sys.platform == "darwin":
         candidates.extend(_default_macos_redline_candidates())
@@ -152,7 +160,7 @@ def find_redline(paths: Optional[RedlinePaths] = None) -> Path:
         )
 
     for candidate in candidates:
-        if candidate.exists() and os.access(candidate, os.X_OK):
+        if candidate.exists() and candidate.is_file() and os.access(candidate, os.X_OK):
             return candidate.resolve()
 
     which = shutil.which("REDline")
@@ -193,6 +201,24 @@ def _default_macos_redline_candidates() -> List[Path]:
 
 
 def probe_redline(paths: Optional[RedlinePaths] = None, timeout: float = 5.0) -> RedlineProbe:
+    paths = paths or RedlinePaths()
+    explicit_path = Path(paths.explicit_path).expanduser() if paths.explicit_path else None
+    if explicit_path is not None:
+        resolved, bundle_path, resolution_message = _resolve_redline_candidate(explicit_path)
+        if resolved is None:
+            bundle_selected = bool(bundle_path and bundle_path.suffix.lower() == ".app")
+            return RedlineProbe(
+                executable=None,
+                available=False,
+                compatible=False,
+                message=resolution_message,
+                selected_path=explicit_path,
+                bundle_path=bundle_path,
+                bundle_selected=bundle_selected,
+                resolution_note=resolution_message,
+            )
+        paths = RedlinePaths(explicit_path=resolved, env_var_name=paths.env_var_name)
+
     try:
         executable = find_redline(paths)
     except RedlineError as exc:
@@ -203,6 +229,7 @@ def probe_redline(paths: Optional[RedlinePaths] = None, timeout: float = 5.0) ->
             message=(
                 f"{exc} This machine likely needs a REDCINE-X / REDline install or update before rendering."
             ),
+            selected_path=explicit_path,
         )
 
     try:
@@ -216,12 +243,13 @@ def probe_redline(paths: Optional[RedlinePaths] = None, timeout: float = 5.0) ->
     except Exception as exc:
         return RedlineProbe(
             executable=executable,
-            available=True,
+            available=False,
             compatible=False,
             message=(
-                f"Found REDline at {executable}, but it could not be queried ({exc}). "
-                "Please update REDCINE-X / REDline."
+                f"REDline exists at {executable}, but it could not be validated ({exc}). "
+                "Choose the REDline binary inside REDCINE-X PRO or update REDCINE-X / REDline."
             ),
+            selected_path=explicit_path or executable,
         )
 
     help_text = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
@@ -236,6 +264,7 @@ def probe_redline(paths: Optional[RedlinePaths] = None, timeout: float = 5.0) ->
                 "Please update REDCINE-X / REDline on this machine."
             ),
             help_text=help_text,
+            selected_path=explicit_path or executable,
         )
 
     return RedlineProbe(
@@ -244,7 +273,56 @@ def probe_redline(paths: Optional[RedlinePaths] = None, timeout: float = 5.0) ->
         compatible=True,
         message=f"REDline ready: {executable}",
         help_text=help_text,
+        selected_path=explicit_path or executable,
     )
+
+
+def _resolve_redline_candidate(path: Path) -> Tuple[Optional[Path], Optional[Path], str]:
+    candidate = path.expanduser().resolve()
+    bundle_path = _app_bundle_ancestor(candidate) or (candidate if candidate.suffix.lower() == ".app" else None)
+    if bundle_path is not None:
+        executable = _find_redline_in_bundle(bundle_path)
+        if executable is not None and executable.is_file() and os.access(executable, os.X_OK):
+            return executable, bundle_path, f"Resolved REDline inside {bundle_path.name}: {executable}"
+        return (
+            None,
+            bundle_path,
+            (
+                f"{bundle_path} is a REDCINE-X application bundle, not the REDline CLI binary. "
+                "Choose the REDline executable inside Contents/MacOS, or install a REDCINE-X build that includes the REDline command-line tool."
+            ),
+        )
+    if not candidate.exists():
+        return None, None, f"Selected REDline path does not exist: {candidate}"
+    if not candidate.is_file():
+        return None, None, f"Selected REDline path is not an executable file: {candidate}"
+    if not os.access(candidate, os.X_OK):
+        return None, None, f"Selected REDline path is not executable: {candidate}"
+    return candidate, None, f"Using REDline executable: {candidate}"
+
+
+def _app_bundle_ancestor(path: Path) -> Optional[Path]:
+    for current in (path, *path.parents):
+        if current.suffix.lower() == ".app":
+            return current
+    return None
+
+
+def _find_redline_in_bundle(bundle_path: Path) -> Optional[Path]:
+    macos_dir = bundle_path / "Contents" / "MacOS"
+    if not macos_dir.is_dir():
+        return None
+    preferred = [
+        macos_dir / "REDline",
+        macos_dir / "REDLine",
+    ]
+    for candidate in preferred:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate.resolve()
+    for candidate in sorted(macos_dir.iterdir(), key=lambda item: item.name.lower()):
+        if candidate.is_file() and "redline" in candidate.name.lower() and os.access(candidate, os.X_OK):
+            return candidate.resolve()
+    return None
 
 
 def build_redline_command(redline_exe: Path | str, job: RenderJob) -> List[str]:
