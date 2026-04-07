@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import Optional
+import logging
 
 from .metadata import ClipMetadata, load_clip_metadata
 from .timecode import frame_to_timecode
+from .tool_resolver import resolve_ffmpeg, resolve_ffprobe
 
+logger = logging.getLogger(__name__)
 
 GENERIC_VIDEO_EXTENSIONS = {
     ".mov",
@@ -37,11 +39,11 @@ def provider_kind_for_path(path: Path) -> str:
 
 
 def supports_generic_video_metadata() -> bool:
-    return shutil.which("ffprobe") is not None
+    return resolve_ffprobe() is not None
 
 
 def supports_generic_video_rendering() -> bool:
-    return shutil.which("ffmpeg") is not None
+    return resolve_ffmpeg() is not None
 
 
 def load_provider_metadata(
@@ -67,7 +69,8 @@ def _load_generic_video_metadata(
     clip_path = clip_path.expanduser().resolve()
     manufacturer = _manufacturer_for_extension(clip_path.suffix.lower(), provider_kind)
     format_type = clip_path.suffix.lstrip(".").upper() or "Video"
-    ffprobe = shutil.which("ffprobe")
+
+    ffprobe = resolve_ffprobe()
     if not ffprobe:
         return ClipMetadata(
             clip_path=clip_path,
@@ -78,7 +81,7 @@ def _load_generic_video_metadata(
             resolution=None,
             timecode_source="ffprobe unavailable",
             drop_frame=False,
-            sync_basis="Generic video provider (ffprobe unavailable).",
+            sync_basis="Generic video provider (ffprobe not found on this system).",
             metadata_ok=False,
             raw_fields={},
             end_timecode=None,
@@ -106,6 +109,16 @@ def _load_generic_video_metadata(
         timeout=timeout,
         check=False,
     )
+
+    if result.returncode != 0:
+        logger.warning(
+            "ffprobe (%s) exited with code %d for %s.\nstderr: %s",
+            ffprobe,
+            result.returncode,
+            clip_path,
+            result.stderr.strip(),
+        )
+
     payload = (result.stdout or "").strip()
     if not payload:
         return ClipMetadata(
@@ -117,7 +130,10 @@ def _load_generic_video_metadata(
             resolution=None,
             timecode_source="ffprobe empty",
             drop_frame=False,
-            sync_basis="Generic video provider returned no probe data.",
+            sync_basis=(
+                f"ffprobe ({ffprobe}) returned no probe data. "
+                f"stderr: {result.stderr.strip() or '(none)'}"
+            ),
             metadata_ok=False,
             raw_fields={},
             end_timecode=None,
@@ -163,7 +179,7 @@ def _load_generic_video_metadata(
     metadata_ok = bool(start_timecode and end_timecode and fps and total_frames and total_frames > 0)
     timecode_supported = bool(start_timecode and end_timecode)
     sync_basis = (
-        f"Generic video provider ({provider_kind}, ffprobe)"
+        f"Generic video provider ({provider_kind}, ffprobe @ {ffprobe})"
         if metadata_ok
         else f"Generic video provider ({provider_kind}) could not confirm trustworthy LTC/timecode metadata."
     )

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import shutil
+import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +10,9 @@ from typing import Optional
 
 from .batch import JobPlanItem
 from .redline import RenderResult, render_frame
+from .tool_resolver import resolve_ffmpeg
+
+logger = logging.getLogger(__name__)
 
 
 class MediaRenderError(RuntimeError):
@@ -51,9 +54,16 @@ def build_replay_command(item: JobPlanItem, *, redline_exe: Optional[str]) -> li
         from .redline import build_redline_command
 
         return build_redline_command(redline_exe or "", item.render_job)
-    ffmpeg = shutil.which("ffmpeg")
+
+    ffmpeg = resolve_ffmpeg()
     if not ffmpeg:
-        return ["echo", f"Generic render unavailable for {item.clip.source_path.name}: ffmpeg not installed."]
+        return [
+            "echo",
+            (
+                f"Generic render unavailable for {item.clip.source_path.name}: "
+                "ffmpeg could not be located. Check /opt/homebrew/bin or /usr/local/bin."
+            ),
+        ]
     select_expr = f"select=eq(n\\,{max(0, item.frame_resolution.frame_index)})"
     return [
         ffmpeg,
@@ -69,11 +79,14 @@ def build_replay_command(item: JobPlanItem, *, redline_exe: Optional[str]) -> li
 
 
 def _render_generic_frame(item: JobPlanItem, *, min_output_bytes: int) -> GenericRenderResult:
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = resolve_ffmpeg()
     if not ffmpeg:
         raise MediaRenderError(
-            "Generic video rendering requires ffmpeg. Install ffmpeg on this machine to render non-RED sources."
+            "Generic video rendering requires ffmpeg, but it could not be located. "
+            "Searched: PATH (shutil.which), /opt/homebrew/bin, /usr/local/bin. "
+            "Install ffmpeg or configure an explicit path in application preferences."
         )
+
     frame_index = max(0, item.frame_resolution.frame_index)
     select_expr = f"select=eq(n\\,{frame_index})"
     cmd = [
@@ -87,21 +100,40 @@ def _render_generic_frame(item: JobPlanItem, *, min_output_bytes: int) -> Generi
         "1",
         str(item.output_file),
     ]
+
+    logger.debug("Generic render command: %s", " ".join(cmd))
+
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         check=False,
     )
+
     if result.returncode != 0:
-        raise MediaRenderError(result.stderr.strip() or result.stdout.strip() or "ffmpeg render failed.")
+        stderr_text = result.stderr.strip() or result.stdout.strip() or "ffmpeg render failed (no output)."
+        logger.error(
+            "ffmpeg (%s) exited with code %d.\nstderr: %s",
+            ffmpeg,
+            result.returncode,
+            stderr_text,
+        )
+        raise MediaRenderError(
+            f"ffmpeg render failed (exit {result.returncode}): {stderr_text}"
+        )
+
     if not item.output_file.exists():
-        raise MediaRenderError(f"Generic render did not produce output: {item.output_file}")
+        raise MediaRenderError(
+            f"ffmpeg render did not produce expected output file: {item.output_file}"
+        )
+
     size = item.output_file.stat().st_size
     if size < min_output_bytes:
         raise MediaRenderError(
-            f"Generic render output was too small ({size} bytes) for {item.output_file}."
+            f"ffmpeg render output is too small ({size} bytes < {min_output_bytes} minimum) "
+            f"for {item.output_file}."
         )
+
     return GenericRenderResult(
         command=cmd,
         output_path=item.output_file,
