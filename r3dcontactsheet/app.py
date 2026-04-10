@@ -52,6 +52,7 @@ from .batch import (
 from .contact_sheet import ContactSheetItem, build_contact_sheet_pdf
 from .frame_index import FrameTargetRequest, MatchSelectionState, OverlapSubset, _timecode_for_absolute_frame
 from .media_render import build_replay_command, render_plan_item
+from .media_render import render_plan_items_parallel
 from .redline import RedlinePaths, RenderSettings, probe_redline, shell_join
 from .settings import AppSettings, SettingsStore
 
@@ -62,6 +63,13 @@ CONTACT_SHEET_NAME = "r3dcontactsheet_contact_sheet.pdf"
 BUILD_MARKER = "VERIFIED UI BUILD 2026-04-01-RDCFIX"
 WINDOW_TITLE = f"{APP_TITLE} - {BUILD_MARKER}"
 LOGO_NAME = "r3dcontactsheet_logo.png"
+
+
+def _format_preview_progress(processed: int, total: int) -> str:
+    if total <= 0:
+        return "Analyzing clips..."
+    percent = int((processed / total) * 100) if processed else 0
+    return f"Analyzing clips: {processed} / {total} ({percent}%)"
 
 
 class MainWindow(QMainWindow):
@@ -75,6 +83,7 @@ class MainWindow(QMainWindow):
         self.settings = self.store.load()
         self.plan = []
         self.worker: threading.Thread | None = None
+        self.preview_worker: threading.Thread | None = None
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.run_started_at = 0.0
         self.last_replay_script: Path | None = None
@@ -86,6 +95,7 @@ class MainWindow(QMainWindow):
         self.redline_ready = False
         self.preview_table_updating = False
         self._last_probe_log_message: str | None = None
+        self.metadata_cache: dict[tuple[str, str, int, int, str], object] = {}
 
         self._build_ui()
         self._apply_settings_to_ui()
@@ -403,6 +413,12 @@ class MainWindow(QMainWindow):
         self.preview_help_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
         self.preview_help_label.setMaximumWidth(260)
         preview_action_column.addWidget(self.preview_help_label, 0, Qt.AlignRight)
+        self.preview_progress_label = QLabel("")
+        self.preview_progress_label.setObjectName("mutedBlue")
+        self.preview_progress_label.setWordWrap(True)
+        self.preview_progress_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        self.preview_progress_label.setMaximumWidth(260)
+        preview_action_column.addWidget(self.preview_progress_label, 0, Qt.AlignRight)
         top_row.addLayout(preview_action_column)
         layout.addLayout(top_row)
 
@@ -773,7 +789,7 @@ class MainWindow(QMainWindow):
             self._set_health_state("yellow", "REDline unavailable for RED media. Generic video support remains best-effort.")
         self._log_probe_message_once(probe.message)
 
-    def _build_preview_context(self) -> PreviewContext:
+    def _build_preview_context(self, *, progress_callback=None) -> PreviewContext:
         input_path = self._validate_input_path()
         output_path = self._validate_output_path()
         frame_request = self._build_frame_request()
@@ -795,14 +811,19 @@ class MainWindow(QMainWindow):
             sync_mode="sync_off" if self.sync_mode_combo.currentText() == "Sync Off" else "sync_on",
         )
         if redline_path:
-            self._append_log(f"Using REDline: {redline_path}")
-        self._append_log(f"Resolved {len(clips)} clip(s) from {input_path}")
+            self._emit_log(f"Using REDline: {redline_path}")
+        self._emit_log(f"Resolved {len(clips)} clip(s) from {input_path}")
         self.last_contact_sheet_pdf = None
         self.run_button.setText("Build Contact Sheet PDF")
-        context = build_preview_context(clips, options)
+        context = build_preview_context(
+            clips,
+            options,
+            metadata_cache=self.metadata_cache,
+            progress_callback=progress_callback,
+        )
         for metadata in context.metadata_by_clip.values():
             if metadata.metadata_error:
-                self._append_log(metadata.metadata_error)
+                self._emit_log(metadata.metadata_error)
         return context
 
     def _apply_preview_context(self, context: PreviewContext) -> None:
@@ -981,27 +1002,20 @@ class MainWindow(QMainWindow):
             self.overlap_alternates_label.setText("No alternate overlap subsets were found.")
 
     def preview_jobs(self) -> None:
+        if self.preview_worker and self.preview_worker.is_alive():
+            return
         self.last_contact_sheet_pdf = None
         self.run_button.setText("Build Contact Sheet PDF")
         self._set_preview_busy(True, "Building Preview...")
         self.preview_button.repaint()
         self.preview_help_label.repaint()
+        self.preview_progress_label.setText(_format_preview_progress(0, 0))
+        self.preview_progress_label.repaint()
         QCoreApplication.processEvents()
         time.sleep(0.05)
         QCoreApplication.processEvents()
-        try:
-            context = self._build_preview_context()
-            self._apply_preview_context(context)
-            self._append_log(f"Prepared {len(self.plan)} jobs.")
-            if self.last_replay_script is not None:
-                self._append_log(f"Saved replay script: {self.last_replay_script}")
-        except Exception as exc:
-            self._append_log(str(exc))
-            self._set_health_state("red", "Preview failed. Check REDline, source metadata, and output folder settings.")
-            QMessageBox.critical(self, APP_TITLE, str(exc))
-            return
-        finally:
-            self._set_preview_busy(False)
+        self.preview_worker = threading.Thread(target=self._run_preview_worker, daemon=True)
+        self.preview_worker.start()
 
     def run_jobs(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -1036,46 +1050,47 @@ class MainWindow(QMainWindow):
     def _run_jobs_worker(self) -> None:
         successes = 0
         failures = 0
-        for index, item in enumerate(self.plan, start=1):
-            started = time.time()
-            try:
-                result = render_plan_item(
-                    item,
-                    redline_exe=self.redline_edit.text().strip() or None,
-                    min_output_bytes=MIN_OUTPUT_BYTES,
-                )
-                command_text = shell_join(result.command)
-                duration = time.time() - started
-                self.event_queue.put(
-                    (
-                        "job-success",
-                        {
-                            "index": index,
-                            "command": command_text,
-                            "output": str(getattr(result, "job", None).output_file if getattr(result, "job", None) else result.output_path),
-                            "size": result.output_size,
-                            "duration": duration,
-                        },
-                    )
-                )
+        outcomes = render_plan_items_parallel(
+            self.plan,
+            redline_exe=self.redline_edit.text().strip() or None,
+            min_output_bytes=MIN_OUTPUT_BYTES,
+            progress_callback=lambda outcome, completed, total: self.event_queue.put(
+                ("parallel-progress", {"outcome": outcome, "completed": completed, "total": total})
+            ),
+        )
+        for outcome in outcomes:
+            if outcome.error is None:
                 successes += 1
-            except Exception as exc:
+            else:
                 failures += 1
-                self.event_queue.put(
-                    (
-                        "job-failure",
-                        {
-                            "index": index,
-                            "error": str(exc),
-                            "traceback": traceback.format_exc(),
-                        },
-                    )
-                )
-            finally:
-                self.event_queue.put(("progress", {"completed": index, "total": len(self.plan)}))
-
         elapsed = time.time() - self.run_started_at
         self.event_queue.put(("done", {"successes": successes, "failures": failures, "elapsed": elapsed}))
+
+    def _run_preview_worker(self) -> None:
+        try:
+            context = self._build_preview_context(
+                progress_callback=lambda processed, total, clip, metadata: self.event_queue.put(
+                    (
+                        "preview-progress",
+                        {
+                            "processed": processed,
+                            "total": total,
+                            "clip_name": clip.clip_name,
+                        },
+                    )
+                )
+            )
+            self.event_queue.put(("preview-ready", context))
+        except Exception as exc:
+            self.event_queue.put(
+                (
+                    "preview-failure",
+                    {
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                    },
+                )
+            )
 
     def _poll_events(self) -> None:
         while True:
@@ -1089,8 +1104,18 @@ class MainWindow(QMainWindow):
                 self._on_job_failure(payload)
             elif event == "progress":
                 self._on_progress(payload)
+            elif event == "parallel-progress":
+                self._on_parallel_progress(payload)
             elif event == "done":
                 self._on_done(payload)
+            elif event == "preview-progress":
+                self._on_preview_progress(payload)
+            elif event == "preview-ready":
+                self._on_preview_ready(payload)
+            elif event == "preview-failure":
+                self._on_preview_failure(payload)
+            elif event == "log":
+                self._append_log(str(payload))
 
     def _on_job_success(self, payload: object) -> None:
         data = payload  # type: ignore[assignment]
@@ -1102,6 +1127,25 @@ class MainWindow(QMainWindow):
         self._append_log(f"Job {data['index']} failed.")
         self._append_log(str(data["error"]))
 
+    def _on_parallel_progress(self, payload: object) -> None:
+        data = payload  # type: ignore[assignment]
+        outcome = data["outcome"]
+        completed = data["completed"]
+        total = data["total"]
+        if outcome.error is None:
+            result = outcome.result
+            command_text = shell_join(result.command)
+            output_path = str(getattr(result, "job", None).output_file if getattr(result, "job", None) else result.output_path)
+            self._append_log(
+                f"Job {outcome.index} succeeded in {outcome.duration:.1f}s, {result.output_size} bytes."
+            )
+            self._append_log(f"Command: {command_text}")
+            self._append_log(f"Output: {output_path}")
+        else:
+            self._append_log(f"Job {outcome.index} failed.")
+            self._append_log(str(outcome.error))
+        self._on_progress({"completed": completed, "total": total})
+
     def _on_progress(self, payload: object) -> None:
         data = payload  # type: ignore[assignment]
         completed = data["completed"]
@@ -1111,6 +1155,35 @@ class MainWindow(QMainWindow):
         elapsed = time.time() - self.run_started_at if self.run_started_at else 0.0
         eta = (elapsed / completed) * (total - completed) if completed else 0.0
         self.summary_label.setText(f"Rendering {completed}/{total} job(s). Estimated time remaining: {eta:.1f}s.")
+
+    def _on_preview_progress(self, payload: object) -> None:
+        data = payload  # type: ignore[assignment]
+        processed = data["processed"]
+        total = data["total"]
+        clip_name = data["clip_name"]
+        self.preview_progress_label.setText(_format_preview_progress(processed, total))
+        self.preview_help_label.setText(f"Click once — scanning media may take a moment. Current clip: {clip_name}")
+
+    def _on_preview_ready(self, payload: object) -> None:
+        context = payload  # type: ignore[assignment]
+        self._apply_preview_context(context)
+        self._append_log(f"Prepared {len(self.plan)} jobs.")
+        self._append_log(f"Inferred camera count: {len(context.clips)}")
+        self._append_log(f"Sync mode: {self._plan_sync_mode(self.plan)}")
+        if self.last_replay_script is not None:
+            self._append_log(f"Saved replay script: {self.last_replay_script}")
+        self._set_preview_busy(False)
+        self.preview_progress_label.setText("Preview ready.")
+        self.preview_worker = None
+
+    def _on_preview_failure(self, payload: object) -> None:
+        data = payload  # type: ignore[assignment]
+        self._append_log(str(data["error"]))
+        self._set_health_state("red", "Preview failed. Check REDline, source metadata, and output folder settings.")
+        self._set_preview_busy(False)
+        self.preview_progress_label.setText("Preview failed.")
+        self.preview_worker = None
+        QMessageBox.critical(self, APP_TITLE, str(data["error"]))
 
     def _on_done(self, payload: object) -> None:
         data = payload  # type: ignore[assignment]
@@ -1530,6 +1603,8 @@ class MainWindow(QMainWindow):
         else:
             self.preview_button.setStyleSheet("")
             self.preview_help_label.setText("Click once — scanning media may take a moment.")
+            if not self.preview_progress_label.text():
+                self.preview_progress_label.setText("")
 
     def _current_match_timecode_label(self) -> str:
         subset = self._current_active_subset()
@@ -1591,6 +1666,12 @@ class MainWindow(QMainWindow):
         line = f"[{timestamp}] {text}"
         self.log_text.appendPlainText(line)
         print(line, flush=True)
+
+    def _emit_log(self, text: str) -> None:
+        if threading.current_thread() is threading.main_thread():
+            self._append_log(text)
+            return
+        self.event_queue.put(("log", text))
 
     def _set_path_field(self, widget: QLineEdit, value: str) -> None:
         widget.setText(value)

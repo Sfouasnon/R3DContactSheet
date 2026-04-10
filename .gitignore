@@ -24,3 +24,4 @@ runs/
 build_logs/
 runs/
 *.log
+tools/

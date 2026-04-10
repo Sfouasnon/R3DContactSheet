@@ -3,7 +3,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from r3dcontactsheet.batch import BatchOptions, build_job_plan, describe_source_selection, discover_r3d_clips
+from r3dcontactsheet.batch import (
+    BatchOptions,
+    ClipEntry,
+    build_job_plan,
+    build_preview_context,
+    describe_source_selection,
+    discover_r3d_clips,
+)
 from r3dcontactsheet.frame_index import FrameTargetRequest
 from r3dcontactsheet.metadata import ClipMetadata
 from r3dcontactsheet.redline import RenderSettings, RenderJob, build_redline_command, write_batch_file
@@ -119,6 +126,34 @@ class ReplayScriptTests(unittest.TestCase):
             self.assertEqual(plan[0].output_group, "A_CAM_ARRAY")
             self.assertIn("/frames/", str(plan[0].output_file))
             self.assertTrue(plan[0].output_file.name.startswith("001_A003_A001"))
+
+    @patch("r3dcontactsheet.batch.load_provider_metadata")
+    def test_build_preview_context_uses_metadata_cache_and_progress_callback(self, mock_load_provider_metadata):
+        self._configure_mock_metadata(mock_load_provider_metadata)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clip_path = Path(tmpdir) / "A003_A001_0127R2_001.R3D"
+            clip_path.write_text("clip")
+            clip = ClipEntry(
+                source_path=clip_path.resolve(),
+                clip_name=clip_path.stem,
+                reel_name="003",
+                group_name="renders",
+                source_kind="r3d",
+                provider_kind="red",
+            )
+            progress = []
+            cache = {}
+            options = BatchOptions(
+                output_dir=Path(tmpdir) / "out",
+                frame_request=FrameTargetRequest(),
+                settings=RenderSettings(),
+                redline_exe="/Applications/REDline",
+            )
+
+            build_preview_context([clip, clip], options, metadata_cache=cache, progress_callback=lambda processed, total, _clip, _metadata: progress.append((processed, total)))
+
+            self.assertEqual(mock_load_provider_metadata.call_count, 1)
+            self.assertEqual(progress, [(1, 1)])
 
     def _configure_mock_metadata(self, mock_load_provider_metadata):
         mock_load_provider_metadata.return_value = ClipMetadata(

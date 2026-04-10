@@ -5,6 +5,7 @@ REDline wrapper utilities for deterministic single-frame JPEG renders.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import shlex
 import shutil
@@ -14,6 +15,9 @@ from glob import glob
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
+
+
+logger = logging.getLogger(__name__)
 
 
 class RedlineError(RuntimeError):
@@ -395,9 +399,14 @@ def render_frame(
 ) -> RenderResult:
     exe = Path(redline_exe) if redline_exe else find_redline(redline_paths)
     cmd = build_redline_command(exe, job)
+    expected_output = job.output_file.resolve()
 
-    if job.output_file.exists() and not job.overwrite:
-        raise RedlineOutputError(f"Output already exists: {job.output_file}")
+    if expected_output.exists() and not job.overwrite:
+        raise RedlineOutputError(f"Output already exists: {expected_output}")
+
+    logger.info("REDline render expected output: %s", expected_output)
+    for stale_file in _cleanup_output_variants(expected_output):
+        logger.info("Removed stale REDline output artifact: %s", stale_file)
 
     result = subprocess.run(
         cmd,
@@ -407,13 +416,17 @@ def render_frame(
         check=False,
     )
 
-    output_exists = job.output_file.exists()
-    if not output_exists:
-        emitted = _find_emitted_output(job.output_file)
-        if emitted is not None:
-            emitted.replace(job.output_file)
-            output_exists = job.output_file.exists()
-    output_size = job.output_file.stat().st_size if output_exists else 0
+    emitted = _find_emitted_output(expected_output)
+    if emitted is not None and emitted != expected_output:
+        logger.info("REDline emitted output path: %s", emitted)
+        emitted.replace(expected_output)
+        logger.info("Normalized REDline output to expected path: %s", expected_output)
+    elif emitted is not None:
+        logger.info("REDline emitted output path: %s", emitted)
+    for leftover in _cleanup_output_variants(expected_output, keep_expected=True):
+        logger.info("Removed leftover REDline suffix artifact: %s", leftover)
+    output_exists = expected_output.exists()
+    output_size = expected_output.stat().st_size if output_exists else 0
     render_result = RenderResult(
         job=job,
         command=cmd,
@@ -519,6 +532,21 @@ def shell_join(parts: Sequence[str], *, windows: bool = False) -> str:
 
 def _abs_path(path: Path | str) -> Path:
     return Path(path).expanduser().resolve()
+
+
+def _cleanup_output_variants(expected_output: Path, *, keep_expected: bool = False) -> list[Path]:
+    removed: list[Path] = []
+    pattern = f"{expected_output.name}*"
+    for candidate in sorted(expected_output.parent.glob(pattern)):
+        resolved = candidate.resolve()
+        if keep_expected and resolved == expected_output:
+            continue
+        if not keep_expected and resolved == expected_output and not expected_output.exists():
+            continue
+        if resolved.is_file():
+            resolved.unlink(missing_ok=True)
+            removed.append(resolved)
+    return removed
 
 
 def _validate_frame_index(frame_index: int) -> None:

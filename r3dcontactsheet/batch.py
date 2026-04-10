@@ -6,7 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Literal, Optional
+from typing import Callable, Iterable, List, Literal, Optional
 
 from .frame_index import (
     FrameResolution,
@@ -25,6 +25,7 @@ from .redline import RenderJob, RenderSettings
 
 GroupMode = Literal["flat", "parent_folder", "reel_prefix", "custom"]
 SyncMode = Literal["sync_on", "sync_off"]
+MetadataCacheKey = tuple[str, str, int, int, str]
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,9 @@ class ClipEntry:
     package_path: Optional[Path] = None
     segment_count: int = 1
     segment_index: int = 1
+
+
+MetadataProgressCallback = Callable[[int, int, ClipEntry, ClipMetadata], None]
 
 
 @dataclass
@@ -119,20 +123,32 @@ def build_job_plan(clips: Iterable[ClipEntry], options: BatchOptions) -> List[Jo
     return build_job_plan_from_context(context)
 
 
-def build_preview_context(clips: Iterable[ClipEntry], options: BatchOptions) -> PreviewContext:
+def build_preview_context(
+    clips: Iterable[ClipEntry],
+    options: BatchOptions,
+    *,
+    metadata_cache: Optional[dict[MetadataCacheKey, ClipMetadata]] = None,
+    progress_callback: Optional[MetadataProgressCallback] = None,
+) -> PreviewContext:
     output_dir = options.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    clip_list = list(clips)
+    clip_list = _dedupe_clip_entries(list(clips))
     if any(clip.provider_kind == "red" for clip in clip_list) and not options.redline_exe:
         raise ValueError("RED clips require a REDline executable for metadata-driven sync resolution.")
     metadata_by_clip = {}
     clip_fields: dict[Path, ClipOrganization] = {}
-    for clip in clip_list:
-        metadata = load_provider_metadata(
-            clip.source_path,
-            provider_kind=clip.provider_kind,
-            redline_exe=options.redline_exe,
-        )
+    cache = metadata_cache if metadata_cache is not None else {}
+    total = len(clip_list)
+    for index, clip in enumerate(clip_list, start=1):
+        cache_key = _metadata_cache_key(clip, options.redline_exe)
+        metadata = cache.get(cache_key)
+        if metadata is None:
+            metadata = load_provider_metadata(
+                clip.source_path,
+                provider_kind=clip.provider_kind,
+                redline_exe=options.redline_exe,
+            )
+            cache[cache_key] = metadata
         metadata_by_clip[clip.source_path] = metadata
         clip_fields[clip.source_path] = ClipOrganization(
             group_name=clip.group_name,
@@ -141,6 +157,8 @@ def build_preview_context(clips: Iterable[ClipEntry], options: BatchOptions) -> 
             manufacturer=metadata.manufacturer or clip.manufacturer or _manufacturer_for_provider(clip.provider_kind),
             format_type=metadata.format_type or clip.format_type or clip.source_path.suffix.lstrip(".").upper(),
         )
+        if progress_callback is not None:
+            progress_callback(index, total, clip, metadata)
     eligible = [item for item in metadata_by_clip.values() if item.sync_eligible]
     overlap_subsets, selection = analyze_overlap_subsets(eligible, options.frame_request)
     return PreviewContext(
@@ -278,13 +296,17 @@ def describe_source_selection(path: Path) -> str:
 
 def _scan_source_tree(src: Path, group_mode: GroupMode) -> List[ClipEntry]:
     clips: List[ClipEntry] = []
+    seen_sources: set[Path] = set()
     for root, dirnames, filenames in os.walk(src):
         root_path = Path(root)
 
         # Treat RDC packages as single clip containers and do not recurse inside them.
         package_dirs = [name for name in dirnames if name.lower().endswith(".rdc")]
         for package_name in sorted(package_dirs, key=_natural_sort_key):
-            clips.append(_resolve_rdc_package(root_path / package_name, group_mode))
+            clip = _resolve_rdc_package(root_path / package_name, group_mode)
+            if clip.source_path not in seen_sources:
+                seen_sources.add(clip.source_path)
+                clips.append(clip)
         dirnames[:] = [name for name in dirnames if name.lower() not in {name.lower() for name in package_dirs}]
 
         # Standalone R3D files and generic video clips not already represented by an RDC package.
@@ -295,7 +317,8 @@ def _scan_source_tree(src: Path, group_mode: GroupMode) -> List[ClipEntry]:
             if _find_rdc_ancestor(candidate, src) is not None:
                 continue
             clip = _resolve_clip_path(candidate, group_mode)
-            if clip is not None:
+            if clip is not None and clip.source_path not in seen_sources:
+                seen_sources.add(clip.source_path)
                 clips.append(clip)
     return clips
 
@@ -417,6 +440,29 @@ def _default_camera_label(clip_name: str) -> str:
     if len(parts) >= 2:
         return f"{parts[0]} {parts[1]}"
     return clip_name.replace("_", " ")
+
+
+def _dedupe_clip_entries(clips: List[ClipEntry]) -> List[ClipEntry]:
+    unique: list[ClipEntry] = []
+    seen_sources: set[Path] = set()
+    for clip in clips:
+        if clip.source_path in seen_sources:
+            continue
+        seen_sources.add(clip.source_path)
+        unique.append(clip)
+    return unique
+
+
+def _metadata_cache_key(clip: ClipEntry, redline_exe: Optional[str]) -> MetadataCacheKey:
+    stat = clip.source_path.stat()
+    redline_token = redline_exe or ""
+    return (
+        clip.provider_kind,
+        str(clip.source_path.resolve()),
+        stat.st_mtime_ns,
+        stat.st_size,
+        redline_token,
+    )
 
 
 def _manufacturer_for_provider(provider_kind: str) -> str:

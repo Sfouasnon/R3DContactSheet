@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .batch import JobPlanItem
 from .redline import RenderResult, render_frame
@@ -28,6 +31,15 @@ class GenericRenderResult:
     stderr: str
 
 
+@dataclass(frozen=True)
+class PlanRenderOutcome:
+    index: int
+    item: JobPlanItem
+    result: RenderResult | GenericRenderResult | None
+    error: Exception | None
+    duration: float
+
+
 def render_plan_item(
     item: JobPlanItem,
     *,
@@ -44,6 +56,42 @@ def render_plan_item(
             min_output_bytes=min_output_bytes,
         )
     return _render_generic_frame(item, min_output_bytes=min_output_bytes)
+
+
+def render_plan_items_parallel(
+    plan: list[JobPlanItem],
+    *,
+    redline_exe: Optional[str],
+    min_output_bytes: int,
+    max_workers: Optional[int] = None,
+    progress_callback: Optional[Callable[[PlanRenderOutcome, int, int], None]] = None,
+) -> list[PlanRenderOutcome]:
+    if not plan:
+        return []
+    total = len(plan)
+    worker_count = max_workers or min(total, max(os.cpu_count() or 1, 1))
+    worker_count = max(1, min(worker_count, total))
+    outcomes: list[PlanRenderOutcome] = []
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="r3dcontactsheet-render") as executor:
+        future_map = {
+            executor.submit(
+                _render_indexed_item,
+                index,
+                item,
+                redline_exe=redline_exe,
+                min_output_bytes=min_output_bytes,
+            ): index
+            for index, item in enumerate(plan, start=1)
+        }
+        completed = 0
+        for future in as_completed(future_map):
+            outcome = future.result()
+            outcomes.append(outcome)
+            completed += 1
+            if progress_callback is not None:
+                progress_callback(outcome, completed, total)
+    outcomes.sort(key=lambda item: item.index)
+    return outcomes
 
 
 def build_replay_command(item: JobPlanItem, *, redline_exe: Optional[str]) -> list[str]:
@@ -141,3 +189,34 @@ def _render_generic_frame(item: JobPlanItem, *, min_output_bytes: int) -> Generi
         stdout=result.stdout,
         stderr=result.stderr,
     )
+
+
+def _render_indexed_item(
+    index: int,
+    item: JobPlanItem,
+    *,
+    redline_exe: Optional[str],
+    min_output_bytes: int,
+) -> PlanRenderOutcome:
+    started = time.time()
+    try:
+        result = render_plan_item(
+            item,
+            redline_exe=redline_exe,
+            min_output_bytes=min_output_bytes,
+        )
+        return PlanRenderOutcome(
+            index=index,
+            item=item,
+            result=result,
+            error=None,
+            duration=time.time() - started,
+        )
+    except Exception as exc:  # pragma: no cover - exercised via caller tests
+        return PlanRenderOutcome(
+            index=index,
+            item=item,
+            result=None,
+            error=exc,
+            duration=time.time() - started,
+        )

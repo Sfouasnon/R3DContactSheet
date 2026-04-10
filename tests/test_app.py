@@ -2,7 +2,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from r3dcontactsheet.app import BUILD_MARKER, WINDOW_TITLE, _choose_directory_macos
+from r3dcontactsheet.app import BUILD_MARKER, WINDOW_TITLE, _choose_directory_macos, _format_preview_progress
 
 
 class MacChooserTests(unittest.TestCase):
@@ -40,6 +40,10 @@ class MacChooserTests(unittest.TestCase):
     def test_build_marker_constants_are_visible(self):
         self.assertIn("VERIFIED", BUILD_MARKER)
         self.assertIn(BUILD_MARKER, WINDOW_TITLE)
+
+    def test_preview_progress_format(self):
+        self.assertEqual(_format_preview_progress(12, 37), "Analyzing clips: 12 / 37 (32%)")
+        self.assertEqual(_format_preview_progress(0, 0), "Analyzing clips...")
 
 
 if __name__ == "__main__":

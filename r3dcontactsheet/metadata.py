@@ -7,7 +7,6 @@ import os
 import re
 import shlex
 import subprocess
-import tempfile
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
@@ -132,31 +131,7 @@ def _load_perframe_csv(clip_path: Path, redline_exe: Path, timeout: float) -> tu
             result,
             "REDline returned no per-frame CSV output.",
         )
-
-    temp_csv_path: Optional[Path] = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            prefix="r3dcontactsheet_printmeta5_",
-            suffix=".csv",
-            delete=False,
-            mode="w",
-            encoding="utf-8",
-        ) as handle:
-            handle.write(payload)
-            temp_csv_path = Path(handle.name)
-        if temp_csv_path is None or not temp_csv_path.exists() or temp_csv_path.stat().st_size == 0:
-            return [], _format_redline_failure(
-                clip_path,
-                result,
-                "REDline per-frame CSV capture file was not created or was empty.",
-            )
-        rows = _parse_perframe_csv(temp_csv_path.read_text(encoding="utf-8"))
-    finally:
-        if temp_csv_path and temp_csv_path.exists():
-            try:
-                temp_csv_path.unlink()
-            except OSError:
-                pass
+    rows = _parse_perframe_csv(payload)
 
     if not rows:
         return [], _format_redline_failure(

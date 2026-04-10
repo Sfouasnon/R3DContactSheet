@@ -14,10 +14,10 @@ class MediaProviderTests(unittest.TestCase):
         self.assertEqual(provider_kind_for_path(Path("/tmp/clip.braw")), "braw")
         self.assertEqual(provider_kind_for_path(Path("/tmp/clip.mov")), "video")
 
-    @patch("r3dcontactsheet.media_providers.shutil.which")
+    @patch("r3dcontactsheet.media_providers.resolve_ffprobe")
     @patch("r3dcontactsheet.media_providers.subprocess.run")
-    def test_generic_video_metadata_uses_ffprobe_when_available(self, mock_run, mock_which):
-        mock_which.side_effect = lambda name: f"/usr/local/bin/{name}"
+    def test_generic_video_metadata_uses_ffprobe_when_available(self, mock_run, mock_resolve_ffprobe):
+        mock_resolve_ffprobe.return_value = "/usr/local/bin/ffprobe"
         payload = {
             "streams": [
                 {
@@ -46,9 +46,9 @@ class MediaProviderTests(unittest.TestCase):
         self.assertTrue(metadata.metadata_ok)
         self.assertEqual(metadata.provider_name, "video")
 
-    @patch("r3dcontactsheet.media_providers.shutil.which")
-    def test_generic_video_metadata_is_incomplete_when_ffprobe_missing(self, mock_which):
-        mock_which.return_value = None
+    @patch("r3dcontactsheet.media_providers.resolve_ffprobe")
+    def test_generic_video_metadata_is_incomplete_when_ffprobe_missing(self, mock_resolve_ffprobe):
+        mock_resolve_ffprobe.return_value = None
 
         metadata = load_provider_metadata(Path("/tmp/clip.mov"), provider_kind="video")
 

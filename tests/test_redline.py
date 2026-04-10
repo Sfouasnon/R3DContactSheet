@@ -42,6 +42,32 @@ class RenderOutputDetectionTests(unittest.TestCase):
             self.assertEqual(result.output_exists, True)
             self.assertGreaterEqual(result.output_size, 4096)
 
+    @patch("r3dcontactsheet.redline.subprocess.run")
+    def test_render_frame_removes_stale_suffix_outputs_before_and_after_rerun(self, mock_run):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            expected_output = root / "001_CamA.jpg"
+            stale_output = root / "001_CamA.jpg.000096.jpg"
+            expected_output.write_bytes(b"old" * 1024)
+            stale_output.write_bytes(b"stale" * 1024)
+
+            def fake_run(*args, **kwargs):
+                (root / "001_CamA.jpg.000001.jpg").write_bytes(b"x" * 4096)
+                return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+            mock_run.side_effect = fake_run
+            job = RenderJob(
+                input_file=root / "clip.R3D",
+                frame_index=6,
+                output_file=expected_output,
+                settings=RenderSettings(),
+            )
+
+            render_frame(job, redline_exe="/Applications/REDline", min_output_bytes=1024)
+
+            self.assertTrue(expected_output.exists())
+            self.assertEqual(sorted(path.name for path in root.glob("001_CamA.jpg*")), ["001_CamA.jpg"])
+
     def test_default_macos_candidates_include_common_redline_names(self):
         candidates = _default_macos_redline_candidates()
         candidate_strings = {str(path) for path in candidates}
