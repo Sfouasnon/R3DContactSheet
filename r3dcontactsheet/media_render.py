@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from .batch import JobPlanItem
+from .batch import GenericRenderSettings, JobPlanItem
+from .media_providers import extract_red_thumbnail_jpeg
 from .redline import RenderResult, render_frame
 from .tool_resolver import resolve_ffmpeg
 
@@ -54,6 +55,15 @@ def render_plan_item(
             item.render_job,
             redline_exe=redline_exe,
             min_output_bytes=min_output_bytes,
+        )
+    if provider_name == "thumbnail":
+        output_path = extract_red_thumbnail_jpeg(item.clip.source_path, item.output_file)
+        return GenericRenderResult(
+            command=["extract-red-thumbnail", str(item.clip.source_path), str(output_path)],
+            output_path=output_path,
+            output_size=output_path.stat().st_size,
+            stdout="",
+            stderr="",
         )
     return _render_generic_frame(item, min_output_bytes=min_output_bytes)
 
@@ -103,6 +113,9 @@ def build_replay_command(item: JobPlanItem, *, redline_exe: Optional[str]) -> li
 
         return build_redline_command(redline_exe or "", item.render_job)
 
+    if provider_name == "thumbnail":
+        return ["echo", f"Extract RED thumbnail preview: {item.clip.source_path}"]
+
     ffmpeg = resolve_ffmpeg()
     if not ffmpeg:
         return [
@@ -112,18 +125,7 @@ def build_replay_command(item: JobPlanItem, *, redline_exe: Optional[str]) -> li
                 "ffmpeg could not be located. Check /opt/homebrew/bin or /usr/local/bin."
             ),
         ]
-    select_expr = f"select=eq(n\\,{max(0, item.frame_resolution.frame_index)})"
-    return [
-        ffmpeg,
-        "-y",
-        "-i",
-        str(item.clip.source_path),
-        "-vf",
-        select_expr,
-        "-frames:v",
-        "1",
-        str(item.output_file),
-    ]
+    return _build_generic_ffmpeg_command(ffmpeg, item)
 
 
 def _render_generic_frame(item: JobPlanItem, *, min_output_bytes: int) -> GenericRenderResult:
@@ -135,19 +137,7 @@ def _render_generic_frame(item: JobPlanItem, *, min_output_bytes: int) -> Generi
             "Install ffmpeg or configure an explicit path in application preferences."
         )
 
-    frame_index = max(0, item.frame_resolution.frame_index)
-    select_expr = f"select=eq(n\\,{frame_index})"
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-i",
-        str(item.clip.source_path),
-        "-vf",
-        select_expr,
-        "-frames:v",
-        "1",
-        str(item.output_file),
-    ]
+    cmd = _build_generic_ffmpeg_command(ffmpeg, item)
 
     logger.debug("Generic render command: %s", " ".join(cmd))
 
@@ -200,6 +190,8 @@ def _render_indexed_item(
 ) -> PlanRenderOutcome:
     started = time.time()
     try:
+        item.output_file.parent.mkdir(parents=True, exist_ok=True)
+        item.output_file.unlink(missing_ok=True)
         result = render_plan_item(
             item,
             redline_exe=redline_exe,
@@ -220,3 +212,60 @@ def _render_indexed_item(
             error=exc,
             duration=time.time() - started,
         )
+
+
+def _build_generic_ffmpeg_command(ffmpeg: str, item: JobPlanItem) -> list[str]:
+    frame_index = max(0, item.frame_resolution.frame_index)
+    settings = item.generic_settings
+    seek_seconds, residual_frame = _seek_plan(frame_index, item.clip_metadata.clip_fps, settings)
+    select_expr = f"select=eq(n\\,{residual_frame})"
+    filters = [select_expr, _colorspace_filter(item, settings)]
+    command = [ffmpeg, "-y"]
+    if seek_seconds is not None:
+        command.extend(["-ss", f"{seek_seconds:.9f}"])
+    command.extend([
+        "-i",
+        str(item.clip.source_path),
+        "-vf",
+        ",".join(filters),
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        str(item.output_file),
+    ])
+    return command
+
+
+def _seek_plan(
+    frame_index: int,
+    fps: Optional[float],
+    settings: GenericRenderSettings,
+) -> tuple[Optional[float], int]:
+    """Seek close to long-clip targets while retaining a short exact decode tail."""
+
+    if not fps or fps <= 0 or frame_index < settings.seek_threshold_frames:
+        return None, frame_index
+    preroll_frames = max(1, int(round(fps * 2.0)))
+    seek_frame = max(0, frame_index - preroll_frames)
+    return seek_frame / fps, frame_index - seek_frame
+
+
+def _colorspace_filter(item: JobPlanItem, settings: GenericRenderSettings) -> str:
+    """Normalize decoded stills to an sRGB/Rec.709 display-referred JPEG."""
+
+    raw = item.clip_metadata.raw_fields
+    declared = any(
+        str(raw.get(key, "")).strip().lower() not in {"", "unknown", "unspecified", "reserved", "2"}
+        for key in ("color_space", "color_transfer", "color_primaries")
+    )
+    output = "space=bt709:primaries=bt709:trc=srgb:range=pc:format=yuv444p:dither=fsb"
+    if declared:
+        return f"colorspace={output}"
+    fallback = {
+        "rec709": "iall=bt709",
+        "rec2020": "iall=bt2020",
+        "p3_d65": "ispace=bt709:iprimaries=smpte432:itrc=srgb",
+        "srgb": "ispace=bt709:iprimaries=bt709:itrc=srgb",
+    }.get(settings.source_colorspace_fallback, "iall=bt709")
+    return f"colorspace={output}:{fallback}"

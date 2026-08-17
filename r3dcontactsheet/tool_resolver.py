@@ -1,4 +1,4 @@
-"""Shared resolver for ffmpeg and ffprobe executables.
+"""Shared resolver for ffmpeg-family and metadata helper executables.
 
 Packaged macOS .app bundles do not inherit the shell PATH (e.g. /opt/homebrew/bin
 is not on the process PATH even though it is available in Terminal). This module
@@ -108,3 +108,13 @@ def resolve_ffmpeg(override: Optional[str] = None) -> Optional[str]:
 def resolve_ffprobe(override: Optional[str] = None) -> Optional[str]:
     """Resolve the ``ffprobe`` executable. See :func:`resolve_tool`."""
     return resolve_tool("ffprobe", override=override)
+
+
+def resolve_mediainfo(override: Optional[str] = None) -> Optional[str]:
+    """Resolve the ``mediainfo`` executable. See :func:`resolve_tool`."""
+    return resolve_tool("mediainfo", override=override)
+
+
+def resolve_ltcdump(override: Optional[str] = None) -> Optional[str]:
+    """Resolve the ``ltcdump`` executable. See :func:`resolve_tool`."""
+    return resolve_tool("ltcdump", override=override)

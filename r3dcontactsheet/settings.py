@@ -20,6 +20,8 @@ class AppSettings:
     redline_path: str = ""
     last_input_path: str = ""
     last_output_path: str = ""
+    batch_input_path: str = ""
+    batch_output_path: str = ""
     frame_index: int = 6
     target_timecode: str = ""
     fps: str = "23.976"
@@ -36,6 +38,8 @@ class AppSettings:
     alphabetize: bool = True
     metadata_mode: bool = True
     sync_mode: str = "sync_on"
+    batch_sync_mode: str = "sync_on"
+    batch_selection_mode: str = "auto"
     theme_name: str = "dark"
 
 

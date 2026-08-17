@@ -47,6 +47,8 @@ class ClipMetadata:
     sync_eligible: bool = False
     render_supported: bool = False
     metadata_error: str = ""
+    metadata_provenance: str = "redline"
+    metadata_confidence: str = "high"
 
 
 def load_clip_metadata(clip_path: Path, redline_exe: str, timeout: float = 20.0) -> ClipMetadata:
@@ -104,6 +106,8 @@ def load_clip_metadata(clip_path: Path, redline_exe: str, timeout: float = 20.0)
         sync_eligible=metadata_ok,
         render_supported=True,
         metadata_error="" if metadata_ok else perframe_note,
+        metadata_provenance="redline",
+        metadata_confidence="high" if metadata_ok else "unresolved",
     )
 
 

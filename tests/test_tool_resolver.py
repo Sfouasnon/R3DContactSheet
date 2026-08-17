@@ -7,7 +7,7 @@ from unittest.mock import patch, MagicMock
 def _import_tool_resolver():
     spec = importlib.util.spec_from_file_location(
         "tool_resolver",
-        Path(__file__).parent.parent / "tool_resolver.py",
+        Path(__file__).parent.parent / "r3dcontactsheet" / "tool_resolver.py",
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -74,6 +74,12 @@ class TestConvenience(unittest.TestCase):
     def test_ffprobe_override_passed(self):
         with patch.object(_tr, "resolve_tool", return_value="/x") as m:
             _tr.resolve_ffprobe(override="/x"); m.assert_called_once_with("ffprobe", override="/x")
+    def test_mediainfo_delegates(self):
+        with patch.object(_tr, "resolve_tool", return_value="/opt/homebrew/bin/mediainfo") as m:
+            r = _tr.resolve_mediainfo(); m.assert_called_once_with("mediainfo", override=None)
+    def test_ltcdump_delegates(self):
+        with patch.object(_tr, "resolve_tool", return_value="/opt/homebrew/bin/ltcdump") as m:
+            r = _tr.resolve_ltcdump(); m.assert_called_once_with("ltcdump", override=None)
 
 class TestFallbackDirs(unittest.TestCase):
     def test_homebrew_in_fallback_dirs(self):
@@ -83,7 +89,7 @@ class TestFallbackDirs(unittest.TestCase):
 
 class TestErrorMessages(unittest.TestCase):
     def test_render_error_mentions_searched_paths(self):
-        src = (Path(__file__).parent.parent / "media_render.py").read_text()
+        src = (Path(__file__).parent.parent / "r3dcontactsheet" / "media_render.py").read_text()
         self.assertIn("/opt/homebrew/bin", src)
         self.assertIn("/usr/local/bin", src)
         self.assertNotIn("Install ffmpeg on this machine to render non-RED sources.", src)

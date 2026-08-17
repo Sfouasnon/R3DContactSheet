@@ -1,8 +1,18 @@
+import os
 import subprocess
 import unittest
 from unittest.mock import patch
 
-from r3dcontactsheet.app import BUILD_MARKER, WINDOW_TITLE, _choose_directory_macos, _format_preview_progress
+from PySide6.QtWidgets import QApplication
+
+from r3dcontactsheet.app import (
+    BUILD_MARKER,
+    MainWindow,
+    WINDOW_TITLE,
+    _choose_directory_macos,
+    _format_batch_progress,
+    _format_preview_progress,
+)
 
 
 class MacChooserTests(unittest.TestCase):
@@ -44,6 +54,34 @@ class MacChooserTests(unittest.TestCase):
     def test_preview_progress_format(self):
         self.assertEqual(_format_preview_progress(12, 37), "Analyzing clips: 12 / 37 (32%)")
         self.assertEqual(_format_preview_progress(0, 0), "Analyzing clips...")
+        self.assertEqual(_format_batch_progress("Scanning clips", 58, 412), "Scanning clips: 58 / 412 (14%)")
+
+
+class BatchingLayoutTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_batching_layout_prioritizes_main_table_height(self):
+        window = MainWindow()
+        try:
+            self.assertGreaterEqual(window.batch_table.minimumHeight(), 400)
+            self.assertLessEqual(window.batch_log_text.minimumHeight(), 90)
+            self.assertLess(window.batch_detail_table.minimumHeight(), window.batch_table.minimumHeight())
+            self.assertIsNotNone(window.batch_main_splitter)
+            self.assertFalse(window.batch_inline_panel.isVisible())
+            self.assertEqual(window.batch_detail_tabs.count(), 3)
+            self.assertEqual(window.batch_needs_assignment_button.text(), "Needs Assignment (0)")
+            self.assertFalse(window.batch_hide_details_button.isVisible())
+            self.assertEqual(window.tabs.tabText(0), "Settings")
+            self.assertEqual(window.tabs.tabText(1), "Preview")
+            self.assertEqual(window.tabs.tabText(2), "Batching")
+            self.assertEqual(window.tabs.tabText(3), "Render")
+            self.assertEqual(window.batch_source_button.text(), "Choose Batch Source")
+            self.assertEqual(window.choose_source_button.text(), "Choose Preview Source...")
+        finally:
+            window.close()
 
 
 if __name__ == "__main__":
